@@ -1,0 +1,46 @@
+{
+  "name": "grokbuild-gateway",
+  "version": "0.3.0",
+  "description": "CC Switch-style provider/model switcher for Grok Build with a local hot-reload gateway",
+  "type": "module",
+  "bin": {
+    "gbg": "./dist/cli.js"
+  },
+  "scripts": {
+    "embed": "node scripts/embed-public.mjs",
+    "build": "node scripts/embed-public.mjs && tsc && node scripts/copy-public.mjs",
+    "build:exe": "node scripts/embed-public.mjs && bun build ./src/cli.ts --compile --minify --outfile release/gbg.exe",
+    "build:desktop": "node scripts/build-desktop.mjs",
+    "build:all": "npm run build:exe && npm run build:desktop",
+    "dev": "node scripts/embed-public.mjs && tsx src/cli.ts serve",
+    "dev:desktop": "cargo run --manifest-path src-tauri/Cargo.toml",
+    "start": "node dist/cli.js serve",
+    "start:exe": "release\\gbg.exe serve",
+    "test": "vitest run",
+    "test:watch": "vitest",
+    "typecheck": "node scripts/embed-public.mjs && tsc --noEmit",
+    "gbg": "tsx src/cli.ts"
+  },
+  "engines": {
+    "node": ">=20"
+  },
+  "keywords": [
+    "grok",
+    "gateway",
+    "openai-compatible",
+    "model-router"
+  ],
+  "license": "MIT",
+  "dependencies": {
+    "@hono/node-server": "^1.14.4",
+    "commander": "^14.0.0",
+    "hono": "^4.8.5",
+    "zod": "^3.25.76"
+  },
+  "devDependencies": {
+    "@types/node": "^24.0.15",
+    "tsx": "^4.20.3",
+    "typescript": "^5.8.3",
+    "vitest": "^3.2.4"
+  }
+}

@@ -1,0 +1,55 @@
+# ── Dependencies ──────────────────────────────────────────
+node_modules/
+
+# ── Node / TypeScript build ───────────────────────────────
+dist/
+*.tsbuildinfo
+coverage/
+
+# ── Release binaries (build with npm run build:exe / build:desktop) ──
+release/
+*.exe
+*.msi
+*.nsis.zip
+
+# ── Generated sources (do not hand-edit / do not commit) ──
+# UI assets baked into the gateway at build time
+src/server/embedded-public.ts
+# Gateway binary baked into the desktop client (copied from release/gbg.exe)
+src-tauri/embedded/*
+!src-tauri/embedded/.gitignore
+
+# ── Rust / Tauri ──────────────────────────────────────────
+src-tauri/target/
+src-tauri/gen/
+# Wix / NSIS intermediate (if bundle is run)
+src-tauri/WixTools/
+*.pdb
+
+# ── Env & secrets ─────────────────────────────────────────
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+
+# ── Logs ──────────────────────────────────────────────────
+*.log
+logs/
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+
+# ── OS / editor ───────────────────────────────────────────
+.DS_Store
+Thumbs.db
+Desktop.ini
+.idea/
+.vscode/
+*.swp
+*~
+
+# ── Test / local scratch ──────────────────────────────────
+.tmp/
+tmp/
+.cache/

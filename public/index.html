@@ -1,0 +1,277 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>GrokBuild Gateway</title>
+    <link rel="stylesheet" href="/styles.css" />
+  </head>
+  <body>
+    <div class="app">
+      <header class="topbar">
+        <div class="brand">
+          <div class="brand-mark">GBG</div>
+          <div>
+            <h1>GrokBuild Gateway</h1>
+            <p class="subtitle">本地模型供应商切换 · 映射 · 热更新网关</p>
+          </div>
+        </div>
+        <div class="topbar-right">
+          <div class="theme-switch" id="theme-switch" title="界面主题">
+            <button type="button" data-theme-set="light">浅色</button>
+            <button type="button" data-theme-set="dark">深色</button>
+            <button type="button" data-theme-set="system" class="active">系统</button>
+          </div>
+          <div id="proxy-badge" class="badge" title="本机网关代理保护">代理盾…</div>
+          <div id="health-badge" class="badge">连接中…</div>
+          <button id="btn-refresh" class="btn ghost sm">刷新</button>
+        </div>
+      </header>
+
+      <nav class="tabs" role="tablist">
+        <button data-tab="dashboard" class="tab active">总览</button>
+        <button data-tab="providers" class="tab">供应商</button>
+        <button data-tab="maps" class="tab">模型映射</button>
+        <button data-tab="models" class="tab">虚拟模型</button>
+        <button data-tab="logs" class="tab">请求日志</button>
+      </nav>
+
+      <main>
+        <!-- Dashboard -->
+        <section id="tab-dashboard" class="panel active">
+          <div class="grid stats" id="dash-stats-cards">
+            <div class="card stat-card">
+              <div class="stat-label">Active</div>
+              <div class="stat-value" id="stat-active">—</div>
+              <div class="stat-sub" id="stat-active-sub">当前供应商</div>
+            </div>
+            <div class="card stat-card">
+              <div class="stat-label">Listen</div>
+              <div class="stat-value" id="stat-listen">—</div>
+              <div class="stat-sub">本地网关地址</div>
+            </div>
+            <div class="card stat-card">
+              <div class="stat-label">Maps / Models</div>
+              <div class="stat-value" id="stat-counts">—</div>
+              <div class="stat-sub">映射数 / 虚拟模型数</div>
+            </div>
+            <div class="card stat-card">
+              <div class="stat-label">Requests</div>
+              <div class="stat-value" id="stat-requests">—</div>
+              <div class="stat-sub" id="stat-requests-sub">近期请求 / 错误</div>
+            </div>
+          </div>
+
+          <div class="card" id="proxy-shield-card">
+            <div class="card-header">
+              <div>
+                <h2>全局代理防护</h2>
+                <p class="hint">
+                  开启后：访问上游默认<strong>直连</strong>（忽略系统 HTTP 代理），本机
+                  <code>127.0.0.1</code> 始终不走代理。关闭后：上游跟随系统/环境代理。
+                </p>
+              </div>
+              <label class="switch" title="全局代理防护">
+                <input type="checkbox" id="toggle-global-proxy-shield" />
+                <span class="switch-slider"></span>
+                <span class="switch-label" id="global-proxy-shield-label">开</span>
+              </label>
+            </div>
+            <p class="hint" id="proxy-shield-detail">—</p>
+          </div>
+
+          <div class="grid two">
+            <div class="card">
+              <div class="card-header">
+                <div>
+                  <h2>Grok 接入</h2>
+                  <p class="hint">一键把 <code>~/.grok/config.toml</code> 指向本网关（自动备份）</p>
+                </div>
+              </div>
+              <dl id="dash-status" class="kv"></dl>
+              <p id="grok-status-line" class="hint"></p>
+              <div class="row" style="margin-top: 0.9rem">
+                <button id="btn-apply-grok" class="btn primary">一键写入 Grok 配置</button>
+                <button id="btn-copy-bootstrap" class="btn">复制片段</button>
+              </div>
+            </div>
+
+            <div class="card">
+              <div class="card-header">
+                <div>
+                  <h2>配置预览</h2>
+                  <p class="hint">写入后需<strong>重启一次</strong> Grok；之后切换供应商免重启</p>
+                </div>
+              </div>
+              <pre id="bootstrap-snippet" class="code"></pre>
+            </div>
+          </div>
+
+          <div class="card">
+            <div class="card-header">
+              <h2>请求统计</h2>
+            </div>
+            <pre id="dash-stats" class="code">—</pre>
+          </div>
+        </section>
+
+        <!-- Providers -->
+        <section id="tab-providers" class="panel">
+          <div class="card">
+            <div class="card-header">
+              <div>
+                <h2>供应商</h2>
+                <p class="hint">切换 active 供应商即时生效，无需重启 Grok</p>
+              </div>
+              <button id="btn-add-provider" class="btn primary">添加供应商</button>
+            </div>
+            <div id="provider-list" class="list"></div>
+          </div>
+
+          <div class="card form-card hidden" id="provider-form-card">
+            <div class="card-header">
+              <h2 id="provider-form-title">添加供应商</h2>
+            </div>
+            <form id="provider-form" class="form grid-2">
+              <label>ID <input name="id" required placeholder="okinto" /></label>
+              <label>名称 <input name="name" required placeholder="Okinto" /></label>
+              <label class="full">Base URL <input name="baseUrl" required placeholder="https://api.example.com/v1" /></label>
+              <label class="full">API Key <input name="apiKey" placeholder="env:MY_API_KEY 或 sk-…" /></label>
+              <label>API Backend
+                <select name="apiBackend">
+                  <option value="chat_completions">chat_completions (OpenAI)</option>
+                  <option value="responses">responses (OpenAI Responses)</option>
+                  <option value="messages">messages (Anthropic)</option>
+                </select>
+              </label>
+              <label class="checkbox" style="justify-content:flex-start;margin-top:1.5rem">
+                <input type="checkbox" name="enabled" checked /> 启用
+              </label>
+              <label class="checkbox full" style="justify-content:flex-start">
+                <input type="checkbox" name="proxyShield" checked />
+                代理防护（本供应商直连，忽略系统代理；需全局防护开启才生效）
+              </label>
+              <div class="row full">
+                <button type="submit" class="btn primary">保存</button>
+                <button type="button" id="btn-cancel-provider" class="btn">取消</button>
+              </div>
+            </form>
+          </div>
+        </section>
+
+        <!-- Maps -->
+        <section id="tab-maps" class="panel">
+          <div class="card">
+            <div class="card-header">
+              <div>
+                <h2>模型映射</h2>
+                <p class="hint">Grok 模型名 → 上游真实模型名，可固定供应商</p>
+              </div>
+              <div class="toolbar">
+                <select id="import-provider-maps" class="select-inline"></select>
+                <button id="btn-import-maps" class="btn primary">从上游导入</button>
+              </div>
+            </div>
+
+            <div class="table-wrap">
+              <table class="table">
+                <thead>
+                  <tr>
+                    <th>From</th>
+                    <th>To</th>
+                    <th>Provider</th>
+                    <th style="width: 140px">操作</th>
+                  </tr>
+                </thead>
+                <tbody id="map-body"></tbody>
+              </table>
+            </div>
+
+            <form id="map-form" class="form inline">
+              <input name="from" required placeholder="from（Grok 发出）" />
+              <input name="to" required placeholder="to（上游 id）" list="upstream-model-list" />
+              <input name="providerId" placeholder="provider（可选）" />
+              <button type="submit" class="btn primary">保存映射</button>
+            </form>
+            <datalist id="upstream-model-list"></datalist>
+          </div>
+        </section>
+
+        <!-- Virtual models -->
+        <section id="tab-models" class="panel">
+          <div class="card">
+            <div class="card-header">
+              <div>
+                <h2>虚拟模型</h2>
+                <p class="hint">暴露给 Grok 的 <code>/v1/models</code> 目录，支持编辑与上游同步</p>
+              </div>
+              <div class="toolbar">
+                <select id="import-provider-models" class="select-inline"></select>
+                <button id="btn-import-models" class="btn primary">从上游导入</button>
+              </div>
+            </div>
+
+            <div class="table-wrap">
+              <table class="table">
+                <thead>
+                  <tr>
+                    <th>ID</th>
+                    <th>Name</th>
+                    <th>Context</th>
+                    <th>Owned</th>
+                    <th style="width: 140px">操作</th>
+                  </tr>
+                </thead>
+                <tbody id="vmodel-body"></tbody>
+              </table>
+            </div>
+
+            <form id="vmodel-form" class="form inline">
+              <input name="previousId" type="hidden" />
+              <input name="id" required placeholder="model id" />
+              <input name="name" required placeholder="display name" />
+              <input name="contextWindow" type="number" placeholder="context window" />
+              <input name="ownedBy" placeholder="ownedBy" />
+              <button type="submit" class="btn primary" id="btn-vmodel-submit">添加</button>
+              <button type="button" class="btn hidden" id="btn-vmodel-cancel">取消</button>
+            </form>
+          </div>
+        </section>
+
+        <!-- Logs -->
+        <section id="tab-logs" class="panel">
+          <div class="card">
+            <div class="card-header">
+              <div>
+                <h2>最近请求</h2>
+                <p class="hint">网关代理流量（含协议转换与 tools）</p>
+              </div>
+              <button id="btn-refresh-logs" class="btn">刷新日志</button>
+            </div>
+            <div class="table-wrap">
+              <table class="table">
+                <thead>
+                  <tr>
+                    <th>Time</th>
+                    <th>Method</th>
+                    <th>Path</th>
+                    <th>In → Out</th>
+                    <th>Provider</th>
+                    <th>Status</th>
+                    <th>ms</th>
+                  </tr>
+                </thead>
+                <tbody id="log-body"></tbody>
+              </table>
+            </div>
+          </div>
+        </section>
+      </main>
+
+      <footer class="footer">gbg · local only · 127.0.0.1</footer>
+    </div>
+
+    <div id="toast-root" aria-live="polite"></div>
+    <script src="/app.js"></script>
+  </body>
+</html>

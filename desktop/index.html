@@ -1,0 +1,255 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>GrokBuild Gateway</title>
+    <style>
+      :root {
+        color-scheme: dark light;
+        --bg: #0b0f14;
+        --card: #121a24;
+        --text: #eef3f9;
+        --muted: #8b9bb0;
+        --accent: #5b8cff;
+        --ok: #34d399;
+        --err: #f87171;
+        --border: rgba(148, 163, 184, 0.15);
+        font-family: "Segoe UI", "Microsoft YaHei", system-ui, sans-serif;
+      }
+      @media (prefers-color-scheme: light) {
+        :root {
+          --bg: #f4f7fb;
+          --card: #fff;
+          --text: #0f172a;
+          --muted: #64748b;
+          --border: rgba(15, 23, 42, 0.1);
+        }
+      }
+      * { box-sizing: border-box; }
+      body {
+        margin: 0;
+        min-height: 100vh;
+        background:
+          radial-gradient(700px 360px at 10% -10%, rgba(91,140,255,.18), transparent 55%),
+          var(--bg);
+        color: var(--text);
+        display: grid;
+        place-items: center;
+        padding: 1.5rem;
+      }
+      .card {
+        width: min(440px, 100%);
+        background: var(--card);
+        border: 1px solid var(--border);
+        border-radius: 18px;
+        padding: 1.5rem 1.4rem 1.35rem;
+        box-shadow: 0 18px 50px rgba(0,0,0,.18);
+      }
+      .mark {
+        width: 48px; height: 48px; border-radius: 14px;
+        display: grid; place-items: center;
+        font-weight: 800; color: #fff;
+        background: linear-gradient(135deg, #5b8cff, #7c5cff);
+        margin-bottom: .9rem;
+      }
+      h1 { margin: 0 0 .35rem; font-size: 1.25rem; }
+      p { margin: 0; color: var(--muted); font-size: .92rem; line-height: 1.5; }
+      .status {
+        margin: 1.1rem 0 1.2rem;
+        padding: .75rem .9rem;
+        border-radius: 12px;
+        border: 1px solid var(--border);
+        font-size: .88rem;
+      }
+      .status b { color: var(--text); }
+      .ok { color: var(--ok); }
+      .err { color: var(--err); }
+      .row { display: flex; flex-wrap: wrap; gap: .55rem; }
+      button {
+        appearance: none; border: 0; border-radius: 11px;
+        padding: .65rem 1rem; font: inherit; font-weight: 600;
+        cursor: pointer; color: #fff;
+        background: linear-gradient(135deg, #5b8cff, #6d5cff);
+      }
+      button.secondary {
+        background: transparent; color: var(--text);
+        border: 1px solid var(--border);
+      }
+      button:disabled { opacity: .55; cursor: not-allowed; }
+      .hint { margin-top: 1rem; font-size: .8rem; color: var(--muted); }
+      code { font-family: Consolas, monospace; font-size: .85em; }
+    </style>
+  </head>
+  <body>
+    <div class="card">
+      <div class="mark">GBG</div>
+      <h1>GrokBuild Gateway</h1>
+      <p>桌面客户端 · <b>内置网关</b> · 防系统代理劫持 127.0.0.1</p>
+
+      <div class="status" id="status">检查网关状态…</div>
+
+      <div class="row">
+        <button id="btn-start" type="button">启动网关</button>
+        <button id="btn-stop" class="secondary" type="button">停止网关</button>
+        <button id="btn-open" class="secondary" type="button">打开 WebUI</button>
+      </div>
+
+      <div class="row" style="margin-top:.7rem">
+        <button id="btn-autostart" class="secondary" type="button">开机自启：检测中</button>
+      </div>
+
+      <p class="hint">
+        网关已内置：首次启动会解压到本地缓存并自动运行。
+        地址固定 <code>http://127.0.0.1:8787</code>（不用 localhost），避免系统代理劫持。
+        启动参数 <code>--no-gateway</code> 可跳过自动启动。
+      </p>
+    </div>
+
+    <script>
+      const invoke = window.__TAURI_INTERNALS__
+        ? (cmd, args) => window.__TAURI_INTERNALS__.invoke(cmd, args)
+        : async () => { throw new Error("Not running inside Tauri"); };
+
+      // Tauri 2 global API fallback
+      async function api(cmd, args) {
+        if (window.__TAURI__?.core?.invoke) {
+          return window.__TAURI__.core.invoke(cmd, args);
+        }
+        if (window.__TAURI_INTERNALS__?.invoke) {
+          return window.__TAURI_INTERNALS__.invoke(cmd, args);
+        }
+        // Browser preview: probe only
+        if (cmd === "gateway_status") {
+          try {
+            const r = await fetch("http://127.0.0.1:8787/api/health");
+            const j = await r.json();
+            return {
+              running: !!j.ok,
+              healthy: !!j.ok,
+              port: j.port || 8787,
+              publicBase: j.publicBase || "http://127.0.0.1:8787",
+              pid: null,
+              lastError: null,
+              gbgPath: null,
+            };
+          } catch {
+            return {
+              running: false,
+              healthy: false,
+              port: 8787,
+              publicBase: "http://127.0.0.1:8787",
+              pid: null,
+              lastError: "offline",
+              gbgPath: null,
+            };
+          }
+        }
+        throw new Error("Tauri invoke unavailable");
+      }
+
+      const $ = (id) => document.getElementById(id);
+      let autostartOn = false;
+
+      function render(st) {
+        const el = $("status");
+        const emb = st.embedded !== false ? " · 内置" : "";
+        if (st.healthy) {
+          el.innerHTML = `<b class="ok">网关运行中${emb}</b><br/>${st.publicBase}` +
+            (st.pid ? ` · pid ${st.pid}` : "");
+          $("btn-open").disabled = false;
+        } else if (st.running) {
+          el.innerHTML = `<b class="err">进程在跑但未就绪</b><br/>${st.lastError || "等待 health…"}`;
+          $("btn-open").disabled = true;
+        } else {
+          el.innerHTML = `<b class="err">网关未启动</b><br/>${st.lastError || "点击「启动网关」或等待自动启动"}` +
+            (st.gbgPath ? `<br/><code>${st.gbgPath}</code>` : "");
+          $("btn-open").disabled = true;
+        }
+      }
+
+      async function refresh() {
+        try {
+          const st = await api("gateway_status");
+          render(st);
+          if (st.healthy && new URLSearchParams(location.search).has("auto")) {
+            location.replace(st.publicBase + "/");
+          }
+        } catch (e) {
+          $("status").innerHTML = `<b class="err">状态读取失败</b><br/>${e.message || e}`;
+        }
+      }
+
+      $("btn-start").onclick = async () => {
+        $("btn-start").disabled = true;
+        try {
+          const st = await api("gateway_start");
+          render(st);
+          if (st.healthy) {
+            setTimeout(() => location.replace(st.publicBase + "/"), 250);
+          }
+        } catch (e) {
+          $("status").innerHTML = `<b class="err">启动失败</b><br/>${e.message || e}`;
+        } finally {
+          $("btn-start").disabled = false;
+        }
+      };
+
+      $("btn-stop").onclick = async () => {
+        try {
+          const st = await api("gateway_stop");
+          render(st);
+        } catch (e) {
+          $("status").innerHTML = `<b class="err">停止失败</b><br/>${e.message || e}`;
+        }
+      };
+
+      $("btn-open").onclick = async () => {
+        const st = await api("gateway_status");
+        if (st.healthy) location.replace(st.publicBase + "/");
+      };
+
+      async function refreshAutostart() {
+        const btn = $("btn-autostart");
+        try {
+          if (!window.__TAURI__?.core?.invoke && !window.__TAURI_INTERNALS__) {
+            btn.textContent = "开机自启：仅桌面版";
+            btn.disabled = true;
+            return;
+          }
+          // plugin commands are namespaced in Tauri 2
+          const enabled = await api("plugin:autostart|is_enabled").catch(() => null);
+          if (enabled === null) {
+            // try core plugin path used by tauri-plugin-autostart
+            autostartOn = await window.__TAURI__.core.invoke("plugin:autostart|is_enabled");
+          } else {
+            autostartOn = enabled;
+          }
+          btn.textContent = autostartOn ? "开机自启：开" : "开机自启：关";
+          btn.disabled = false;
+        } catch {
+          btn.textContent = "开机自启：不可用";
+        }
+      }
+
+      $("btn-autostart").onclick = async () => {
+        try {
+          if (autostartOn) {
+            await window.__TAURI__.core.invoke("plugin:autostart|disable");
+            autostartOn = false;
+          } else {
+            await window.__TAURI__.core.invoke("plugin:autostart|enable");
+            autostartOn = true;
+          }
+          $("btn-autostart").textContent = autostartOn ? "开机自启：开" : "开机自启：关";
+        } catch (e) {
+          alert("切换开机自启失败: " + (e.message || e));
+        }
+      };
+
+      refresh();
+      refreshAutostart();
+      setInterval(refresh, 4000);
+    </script>
+  </body>
+</html>
