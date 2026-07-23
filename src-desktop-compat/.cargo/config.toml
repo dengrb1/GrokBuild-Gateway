@@ -1,0 +1,11 @@
+# Prefer static CRT so the exe runs on machines without recent VC++ redist.
+# SUBSYSTEM 6.01 = Windows 7 (major.minor).
+[target.x86_64-pc-windows-msvc]
+rustflags = [
+  "-C", "target-feature=+crt-static",
+]
+
+[target.i686-pc-windows-msvc]
+rustflags = [
+  "-C", "target-feature=+crt-static",
+]

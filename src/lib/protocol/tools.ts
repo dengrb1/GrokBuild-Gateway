@@ -77,12 +77,15 @@ export function chatToolsToResponses(tools: unknown): JsonObject[] {
           type: "object",
           properties: {},
         }) as Json;
-      return {
+      const out: JsonObject = {
         type: "function",
         name,
         description: asString(fn.description ?? tool.description),
         parameters,
       };
+      if (typeof fn.strict === "boolean") out.strict = fn.strict;
+      else if (typeof tool.strict === "boolean") out.strict = tool.strict;
+      return out;
     })
     .filter(notNull);
 }
@@ -100,7 +103,7 @@ export function responsesToolsToChat(tools: unknown): JsonObject[] {
         (tool.parameters as Json) ??
         (asObject(tool.function).parameters as Json) ??
         ({ type: "object", properties: {} } as Json);
-      return {
+      const fn: JsonObject = {
         type: "function",
         function: {
           name,
@@ -110,6 +113,10 @@ export function responsesToolsToChat(tools: unknown): JsonObject[] {
           parameters,
         },
       };
+      if (typeof tool.strict === "boolean") {
+        (fn.function as JsonObject).strict = tool.strict;
+      }
+      return fn;
     })
     .filter(notNull);
 }

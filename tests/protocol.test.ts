@@ -9,6 +9,7 @@ import {
   chatToolsToAnthropic,
   anthropicToolsToChat,
   chatToolsToResponses,
+  responsesToolsToChat,
 } from "../src/lib/protocol/tools.js";
 import {
   chatRequestToAnthropic,
@@ -35,6 +36,7 @@ const chatTools = [
         properties: { city: { type: "string" } },
         required: ["city"],
       },
+      strict: true,
     },
   },
 ];
@@ -69,6 +71,10 @@ describe("tools conversion", () => {
     expect(r[0]).toMatchObject({
       type: "function",
       name: "get_weather",
+      strict: true,
+    });
+    expect(responsesToolsToChat(r)[0]).toMatchObject({
+      function: { strict: true },
     });
   });
 });
@@ -129,6 +135,13 @@ describe("request conversion with tools", () => {
     const input = resp.input as JsonObject[];
     expect(input.some((i) => i.type === "function_call")).toBe(true);
     expect(input.some((i) => i.type === "function_call_output")).toBe(true);
+    const call = input.find((i) => i.type === "function_call") as JsonObject;
+    expect(call.id).toBe("fc_call_1");
+    expect(call.call_id).toBe("call_1");
+    expect(call.id).not.toBe(call.call_id);
+    expect(call.arguments).toBe('{"city":"SF"}');
+    const result = input.find((i) => i.type === "function_call_output") as JsonObject;
+    expect(result.call_id).toBe("call_1");
     expect((resp.tools as { name: string }[])[0].name).toBe("get_weather");
   });
 
@@ -264,6 +277,8 @@ describe("response conversion with tools", () => {
     const resp = chatResponseToResponses(chat);
     expect(resp.object).toBe("response");
     expect((resp.output as unknown[]).length).toBe(2);
+    const call = (resp.output as JsonObject[]).find((item) => item.type === "function_call");
+    expect(call).toMatchObject({ id: "fc_c1", call_id: "c1" });
   });
 
   it("convertResponse matrix", () => {
@@ -324,5 +339,71 @@ describe("SSE parse + transform", () => {
     expect(text).toContain("get_weather");
     expect(text).toContain("[DONE]");
     expect(text).toContain("tool_calls");
+  });
+
+  it("keeps interleaved Responses tool argument deltas on their own indexes", async () => {
+    const sse = [
+      'event: response.created\ndata: {"type":"response.created","response":{"id":"resp_multi","model":"m"}}\n\n',
+      'event: response.output_item.added\ndata: {"type":"response.output_item.added","item":{"type":"function_call","id":"fc_one","call_id":"call_one","name":"one","arguments":""}}\n\n',
+      'event: response.output_item.added\ndata: {"type":"response.output_item.added","item":{"type":"function_call","id":"fc_two","call_id":"call_two","name":"two","arguments":""}}\n\n',
+      'event: response.function_call_arguments.delta\ndata: {"type":"response.function_call_arguments.delta","item_id":"fc_two","delta":"{\\"b\\":"}\n\n',
+      'event: response.function_call_arguments.delta\ndata: {"type":"response.function_call_arguments.delta","item_id":"fc_one","delta":"{\\"a\\":"}\n\n',
+      'event: response.function_call_arguments.delta\ndata: {"type":"response.function_call_arguments.delta","item_id":"fc_two","delta":"2}"}\n\n',
+      'event: response.function_call_arguments.delta\ndata: {"type":"response.function_call_arguments.delta","item_id":"fc_one","delta":"1}"}\n\n',
+      'event: response.completed\ndata: {"type":"response.completed","response":{"id":"resp_multi","status":"completed","output":[{"type":"function_call","id":"fc_one","call_id":"call_one","name":"one","arguments":"{\\"a\\":1}"},{"type":"function_call","id":"fc_two","call_id":"call_two","name":"two","arguments":"{\\"b\\":2}"}]}}\n\n',
+    ].join("");
+    const upstream = new ReadableStream<Uint8Array>({
+      start(controller) {
+        controller.enqueue(new TextEncoder().encode(sse));
+        controller.close();
+      },
+    });
+    const out = transformSseStream(upstream, "responses", "chat_completions");
+    const reader = out.getReader();
+    const decoder = new TextDecoder();
+    let text = "";
+    while (true) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      text += decoder.decode(value);
+    }
+    const events = parseSseChunk(text).events
+      .filter((event) => event.data !== "[DONE]")
+      .map((event) => JSON.parse(event.data) as JsonObject);
+    const toolChunks = events.filter((event) => {
+      const choice = ((event.choices as JsonObject[] | undefined) ?? [])[0];
+      return Array.isArray((choice?.delta as JsonObject | undefined)?.tool_calls);
+    });
+    expect(toolChunks.some((event) => JSON.stringify(event).includes('"index":0'))).toBe(true);
+    expect(toolChunks.some((event) => JSON.stringify(event).includes('"index":1'))).toBe(true);
+    expect(text).toContain('"id":"call_one"');
+    expect(text).toContain('"id":"call_two"');
+    expect(text).toContain('"finish_reason":"tool_calls"');
+    expect(text).toContain("data: [DONE]");
+  });
+
+  it("assembles Responses tools that only appear in the final response output", async () => {
+    const sse =
+      'event: response.completed\ndata: {"type":"response.completed","response":{"id":"resp_final","status":"completed","output":[{"type":"function_call","id":"fc_final","call_id":"call_final","name":"lookup","arguments":"{\\"q\\":\\"x\\"}"}]}}\n\n';
+    const upstream = new ReadableStream<Uint8Array>({
+      start(controller) {
+        controller.enqueue(new TextEncoder().encode(sse));
+        controller.close();
+      },
+    });
+    const out = transformSseStream(upstream, "responses", "chat_completions");
+    const reader = out.getReader();
+    const decoder = new TextDecoder();
+    let text = "";
+    while (true) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      text += decoder.decode(value);
+    }
+    expect(text).toContain('"id":"call_final"');
+    expect(text).toContain('"name":"lookup"');
+    expect(text).toContain('\\"q\\":\\"x\\"');
+    expect(text).toContain('"finish_reason":"tool_calls"');
+    expect(text).toContain("data: [DONE]");
   });
 });

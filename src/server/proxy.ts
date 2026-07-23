@@ -17,6 +17,7 @@ import {
   detectClientProtocol,
   isInferencePath,
   protocolPath,
+  protocolStreamErrorSse,
   transformSseStream,
   type JsonObject,
 } from "../lib/protocol/index.js";
@@ -62,7 +63,7 @@ function buildUpstreamHeaders(
   if (accept) headers.set("accept", accept);
 
   const key = resolveSecret(provider.apiKey);
-  const backend = provider.apiBackend ?? "chat_completions";
+  const backend = provider.apiBackend ?? "responses";
 
   // Anthropic Messages API prefers x-api-key (+ version header)
   if (backend === "messages") {
@@ -116,6 +117,174 @@ function wantsStream(body: JsonObject | null, accept: string | undefined): boole
   if (body && body.stream === true) return true;
   if (accept?.includes("text/event-stream")) return true;
   return false;
+}
+
+type StreamCompletion = {
+  status: number;
+  error?: string;
+  errorStage?: string;
+  streamStarted: boolean;
+};
+
+type StreamWrapperOptions = {
+  signal: AbortSignal;
+  clientSignal?: AbortSignal;
+  timeoutMs: number;
+  timer: ReturnType<typeof setTimeout>;
+  timedOut: () => boolean;
+  clientCancelled: () => boolean;
+  protocol: ApiBackend;
+  status: number;
+  initialError?: string;
+  onCleanup?: () => void;
+  onComplete: (result: StreamCompletion) => void;
+};
+
+function streamErrorMessage(err: unknown): string {
+  return err instanceof Error ? err.message : String(err);
+}
+
+function wrapUpstreamStream(
+  source: ReadableStream<Uint8Array>,
+  options: StreamWrapperOptions,
+): ReadableStream<Uint8Array> {
+  const encoder = new TextEncoder();
+  let reader: ReadableStreamDefaultReader<Uint8Array> | undefined;
+  let settled = false;
+  let streamStarted = false;
+  let clientAbortHandler: (() => void) | undefined;
+  let streamController: ReadableStreamDefaultController<Uint8Array> | undefined;
+
+  const cleanup = () => {
+    clearTimeout(options.timer);
+    if (clientAbortHandler && options.clientSignal) {
+      options.clientSignal.removeEventListener("abort", clientAbortHandler);
+    }
+    options.onCleanup?.();
+  };
+
+  const complete = (result: StreamCompletion) => {
+    if (settled) return;
+    settled = true;
+    cleanup();
+    options.onComplete({ ...result, streamStarted });
+  };
+
+  const closeController = (controller: ReadableStreamDefaultController<Uint8Array>) => {
+    try {
+      controller.close();
+    } catch {
+      // The client may cancel the stream while the upstream read is settling.
+    }
+  };
+
+  return new ReadableStream<Uint8Array>({
+    start(controller) {
+      streamController = controller;
+      reader = source.getReader();
+      clientAbortHandler = () => {
+        if (!options.clientCancelled()) return;
+        complete({
+          status: 499,
+          error: "Client cancelled the request",
+          errorStage: "client",
+          streamStarted,
+        });
+        const cancellation = reader?.cancel("client_cancelled");
+        if (cancellation) void cancellation.catch(() => undefined);
+        try {
+          if (streamController) closeController(streamController);
+        } catch {
+          // The runtime may already have canceled the response body.
+        }
+      };
+      if (options.clientSignal) {
+        options.clientSignal.addEventListener("abort", clientAbortHandler, {
+          once: true,
+        });
+      }
+    },
+    async pull(controller) {
+      if (!reader || settled) return;
+      try {
+        const result = await reader.read();
+        if (result.done) {
+          complete({
+            status: options.status,
+            error: options.initialError,
+            errorStage: options.initialError ? "upstream_http" : undefined,
+            streamStarted,
+          });
+          closeController(controller);
+          return;
+        }
+        if (result.value.byteLength > 0) streamStarted = true;
+        controller.enqueue(result.value);
+      } catch (err) {
+        if (options.clientCancelled()) {
+          complete({
+            status: 499,
+            error: "Client cancelled the request",
+            errorStage: "client",
+            streamStarted,
+          });
+          closeController(controller);
+          return;
+        }
+        const timedOut = options.timedOut();
+        const message = timedOut
+          ? `Upstream stream timed out after ${options.timeoutMs}ms`
+          : `Upstream connection closed while reading the stream: ${streamErrorMessage(err)}`;
+        // The gateway is about to emit a protocol error event, so the client
+        // has a stream response even when upstream sent no body bytes.
+        streamStarted = true;
+        complete({
+          status: timedOut ? 504 : 502,
+          error: message,
+          errorStage: "upstream_body",
+          streamStarted,
+        });
+        controller.enqueue(
+          encoder.encode(
+            protocolStreamErrorSse(
+              options.protocol,
+              message,
+              timedOut ? "upstream_timeout" : "upstream_stream_error",
+            ),
+          ),
+        );
+        closeController(controller);
+      }
+    },
+    cancel(reason) {
+      const cancellation = reader?.cancel(reason);
+      if (cancellation) void cancellation.catch(() => undefined);
+      complete({
+        status: 499,
+        error: "Client cancelled the request",
+        errorStage: "client",
+        streamStarted,
+      });
+    },
+  });
+}
+
+function gatewayErrorSummary(
+  stage: string,
+  providerId: string | null,
+  protocol: ApiBackend | null,
+  proxyMode: "direct" | "env" | undefined,
+  message: string,
+): string {
+  const subject =
+    stage === "upstream_body"
+      ? "upstream stream failed"
+      : stage === "upstream_headers"
+        ? "upstream response headers unavailable"
+        : stage === "client"
+          ? "client cancelled request"
+          : "upstream request failed";
+  return `${subject} (provider=${providerId ?? "unknown"}, protocol=${protocol ?? "unknown"}, proxy=${proxyMode ?? "unknown"}): ${message}`;
 }
 
 export function createProxyHandlers(store: ConfigStore) {
@@ -172,11 +341,45 @@ export function createProxyHandlers(store: ConfigStore) {
     let modelIn: string | null = null;
     let modelOut: string | null = null;
     let provider: Provider;
-    let upstreamProtocol: ApiBackend = "chat_completions";
+    let upstreamProtocol: ApiBackend = "responses";
     let convertedRequest = false;
     let stream = false;
+    let requestBodyMs: number | undefined;
+    let upstreamHeadersMs: number | undefined;
+    let firstByteMs: number | undefined;
+    let durationMs: number | undefined;
+    let proxyMode: "direct" | "env" | undefined;
+    let logWritten = false;
+
+    const recordLog = (
+      status: number,
+      error?: string,
+      extra: Partial<RequestLogEntry> = {},
+    ) => {
+      if (logWritten) return;
+      logWritten = true;
+      const elapsed = Date.now() - started;
+      const first = firstByteMs ?? elapsed;
+      globalRequestLog.add({
+        ...logBase,
+        ...extra,
+        modelIn,
+        modelOut,
+        status,
+        latencyMs: first,
+        requestBodyMs,
+        upstreamHeadersMs,
+        firstByteMs: first,
+        durationMs: durationMs ?? elapsed,
+        clientProtocol,
+        upstreamProtocol,
+        proxyMode,
+        error: error ?? extra.error,
+      });
+    };
 
     try {
+      const bodyStarted = Date.now();
       if (method === "POST" || method === "PUT" || method === "PATCH") {
         const json = await readJsonBody(c);
         if (json && typeof json === "object" && json !== null) {
@@ -185,7 +388,7 @@ export function createProxyHandlers(store: ConfigStore) {
           const route = resolveRoute(cfg, modelIn);
           provider = route.provider;
           modelOut = route.modelOut;
-          upstreamProtocol = provider.apiBackend ?? "chat_completions";
+          upstreamProtocol = provider.apiBackend ?? "responses";
 
           if (modelOut !== null && "model" in obj) {
             obj.model = modelOut;
@@ -206,24 +409,18 @@ export function createProxyHandlers(store: ConfigStore) {
           bodyText = JSON.stringify(obj);
         } else {
           provider = resolveRoute(cfg, null).provider;
-          upstreamProtocol = provider.apiBackend ?? "chat_completions";
+          upstreamProtocol = provider.apiBackend ?? "responses";
           bodyText = await c.req.text();
         }
       } else {
         provider = resolveRoute(cfg, null).provider;
-        upstreamProtocol = provider.apiBackend ?? "chat_completions";
+        upstreamProtocol = provider.apiBackend ?? "responses";
       }
+      requestBodyMs = Date.now() - bodyStarted;
     } catch (err) {
       const message = err instanceof Error ? err.message : String(err);
-      globalRequestLog.add({
-        ...logBase,
-        modelIn,
-        modelOut,
-        providerId: null,
-        status: 400,
-        latencyMs: Date.now() - started,
-        error: message,
-      });
+      requestBodyMs = Date.now() - started;
+      recordLog(400, message, { providerId: null, errorStage: "request" });
       return c.json(
         {
           error: {
@@ -261,10 +458,26 @@ export function createProxyHandlers(store: ConfigStore) {
     );
     const timeoutMs = cfg.server.requestTimeoutMs ?? 600_000;
     const controller = new AbortController();
-    const timer = setTimeout(() => controller.abort(), timeoutMs);
+    let timedOut = false;
+    let clientCancelled = false;
+    let streamOwnsLifecycle = false;
+    let stage = "upstream_headers";
+    const clientSignal = c.req.raw.signal;
+    const onClientAbort = () => {
+      clientCancelled = true;
+      controller.abort("client_cancelled");
+    };
+    if (clientSignal.aborted) onClientAbort();
+    else clientSignal.addEventListener("abort", onClientAbort, { once: true });
+    const timer = setTimeout(() => {
+      timedOut = true;
+      controller.abort("upstream_timeout");
+    }, timeoutMs);
 
     try {
       const forceDirect = isProviderProxyShieldOn(cfg.server, provider);
+      proxyMode = forceDirect ? "direct" : "env";
+      const upstreamStarted = Date.now();
       const upstream = await upstreamFetch(url, {
         method,
         headers,
@@ -275,6 +488,8 @@ export function createProxyHandlers(store: ConfigStore) {
         signal: controller.signal,
         forceDirect,
       });
+      upstreamHeadersMs = Date.now() - upstreamStarted;
+      firstByteMs = Date.now() - started;
 
       const respHeaders = new Headers();
       const passHeaders = [
@@ -290,6 +505,15 @@ export function createProxyHandlers(store: ConfigStore) {
       for (const h of passHeaders) {
         const v = upstream.headers.get(h);
         if (v) respHeaders.set(h, v);
+      }
+      for (const h of [
+        "connection",
+        "content-encoding",
+        "content-length",
+        "keep-alive",
+        "transfer-encoding",
+      ]) {
+        respHeaders.delete(h);
       }
 
       const ct = upstream.headers.get("content-type") ?? "";
@@ -313,14 +537,28 @@ export function createProxyHandlers(store: ConfigStore) {
           );
           respHeaders.set("content-type", "text/event-stream; charset=utf-8");
           respHeaders.set("cache-control", "no-cache");
-          respHeaders.delete("content-length");
         }
-        globalRequestLog.add({
-          ...logBase,
+        streamOwnsLifecycle = true;
+        body = wrapUpstreamStream(body, {
+          signal: controller.signal,
+          clientSignal,
+          timeoutMs,
+          timer,
+          timedOut: () => timedOut,
+          clientCancelled: () => clientCancelled,
+          protocol: clientProtocol ?? upstreamProtocol,
           status: upstream.status,
-          latencyMs: Date.now() - started,
-          stream: true,
-          error: upstream.status >= 400 ? `upstream ${upstream.status}` : undefined,
+          initialError:
+            upstream.status >= 400 ? `upstream ${upstream.status}` : undefined,
+          onCleanup: () => clientSignal.removeEventListener("abort", onClientAbort),
+          onComplete: (result) => {
+            durationMs = Date.now() - started;
+            recordLog(result.status, result.error, {
+              stream: true,
+              streamStarted: result.streamStarted,
+              errorStage: result.errorStage,
+            });
+          },
         });
         return new Response(body, {
           status: upstream.status,
@@ -328,7 +566,9 @@ export function createProxyHandlers(store: ConfigStore) {
         });
       }
 
+      stage = "upstream_body";
       const buf = await upstream.arrayBuffer();
+      durationMs = Date.now() - started;
       let outBuf: ArrayBuffer | Uint8Array = buf;
 
       if (
@@ -390,46 +630,65 @@ export function createProxyHandlers(store: ConfigStore) {
         }
       }
 
-      globalRequestLog.add({
-        ...logBase,
-        status: upstream.status,
-        latencyMs: Date.now() - started,
-        stream: false,
-        error:
-          upstream.status >= 400 ? `upstream ${upstream.status}` : undefined,
-      });
+      recordLog(
+        upstream.status,
+        upstream.status >= 400 ? `upstream ${upstream.status}` : undefined,
+        { stream: false, errorStage: upstream.status >= 400 ? "upstream_http" : undefined },
+      );
       return new Response(outBuf, {
         status: upstream.status,
         headers: respHeaders,
       });
     } catch (err) {
-      const aborted = err instanceof Error && err.name === "AbortError";
-      const message = aborted
-        ? `Upstream timeout after ${timeoutMs}ms`
-        : err instanceof Error
-          ? err.message
-          : String(err);
-      globalRequestLog.add({
-        ...logBase,
-        status: aborted ? 504 : 502,
-        latencyMs: Date.now() - started,
-        error: message,
-      });
-      return c.json(
-        {
-          error: {
-            message,
-            type: "api_error",
-            code: aborted ? "upstream_timeout" : "upstream_error",
-            provider: provider.id,
-            clientProtocol,
-            upstreamProtocol,
-          },
-        },
-        aborted ? 504 : 502,
+      const aborted = timedOut || (err instanceof Error && err.name === "AbortError");
+      const rawMessage = clientCancelled
+        ? "client disconnected"
+        : timedOut
+          ? `timeout after ${timeoutMs}ms`
+          : streamErrorMessage(err);
+      const errorStage = clientCancelled ? "client" : stage;
+      const message = gatewayErrorSummary(
+        errorStage,
+        provider.id,
+        clientProtocol ?? upstreamProtocol,
+        proxyMode,
+        rawMessage,
       );
+      const status = clientCancelled ? 499 : aborted ? 504 : 502;
+      durationMs = Date.now() - started;
+      recordLog(status, message, {
+        errorStage,
+        streamStarted: false,
+      });
+      const errorBody = {
+        error: {
+          message,
+          type: "api_error",
+          code: clientCancelled
+            ? "client_cancelled"
+            : aborted
+              ? "upstream_timeout"
+              : "upstream_error",
+          provider: provider.id,
+          clientProtocol,
+          upstreamProtocol,
+          proxyMode,
+          errorStage,
+          streamStarted: false as const,
+        },
+      };
+      if (status === 499) {
+        return new Response(JSON.stringify(errorBody), {
+          status: 499,
+          headers: { "content-type": "application/json" },
+        });
+      }
+      return c.json(errorBody, status);
     } finally {
-      clearTimeout(timer);
+      if (!streamOwnsLifecycle) {
+        clearTimeout(timer);
+        clientSignal.removeEventListener("abort", onClientAbort);
+      }
     }
   }
 

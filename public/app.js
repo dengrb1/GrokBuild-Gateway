@@ -160,6 +160,76 @@ function fillUpstreamDatalist(models) {
   list.innerHTML = html;
 }
 
+function getMapQuickFillProviderId() {
+  const form = $("#map-form");
+  const explicit = form?.providerId?.value?.trim();
+  if (explicit) return explicit;
+  const selected = $("#import-provider-maps")?.value;
+  return selected || state.config?.activeProviderId || "";
+}
+
+function renderModelQuickFill(providerId, models, message = "") {
+  const root = $("#model-quick-fill");
+  if (!root) return;
+  if (!providerId) {
+    root.innerHTML = `<div class="quick-fill-status">请选择供应商后再填入上游模型</div>`;
+    root.classList.remove("hidden");
+    return;
+  }
+  if (message) {
+    root.innerHTML = `<div class="quick-fill-status">${escapeHtml(message)}</div>`;
+    root.classList.remove("hidden");
+    return;
+  }
+  const query = ($("#map-form")?.to?.value || "").trim().toLowerCase();
+  const list = (models || [])
+    .filter((m) => {
+      if (!query) return true;
+      return `${m.id || ""} ${m.name || ""}`.toLowerCase().includes(query);
+    })
+    .slice(0, 30);
+  if (!list.length) {
+    root.innerHTML = `<div class="quick-fill-status">没有匹配的上游模型 · ${escapeHtml(providerId)}</div>`;
+    root.classList.remove("hidden");
+    return;
+  }
+  let html = `<div class="quick-fill-head"><span>上游模型 · ${escapeHtml(providerId)}</span><span>${list.length} / ${(models || []).length}</span></div><div class="quick-fill-list">`;
+  for (const m of list) {
+    html += `<button type="button" class="model-chip" data-act="quick-fill-model" data-model="${escapeAttr(m.id)}" title="${escapeAttr(m.name || m.id)}">${escapeHtml(m.id)}</button>`;
+  }
+  html += "</div>";
+  root.innerHTML = html;
+  root.classList.remove("hidden");
+}
+
+async function showModelQuickFill({ fetchIfMissing = true } = {}) {
+  const providerId = getMapQuickFillProviderId();
+  const cached = providerId ? state.upstreamCache[providerId] : null;
+  if (cached) {
+    fillUpstreamDatalist(cached);
+    renderModelQuickFill(providerId, cached);
+    return;
+  }
+  if (!fetchIfMissing) {
+    renderModelQuickFill(providerId, [], "先测试或拉取该供应商的模型列表");
+    return;
+  }
+  renderModelQuickFill(providerId, [], `正在获取 ${providerId || "active"} 的模型列表…`);
+  try {
+    const r = await api("/api/fetch-models", {
+      method: "POST",
+      body: JSON.stringify(providerId ? { id: providerId } : {}),
+    });
+    if (!r.ok) throw new Error(r.error || "fetch failed");
+    const id = r.providerId || providerId;
+    state.upstreamCache[id] = r.models || [];
+    fillUpstreamDatalist(r.models || []);
+    renderModelQuickFill(id, r.models || []);
+  } catch (err) {
+    renderModelQuickFill(providerId, [], `获取模型失败：${err.message}`);
+  }
+}
+
 function renderDashboard() {
   const health = state.health;
   const config = state.config;
@@ -303,7 +373,7 @@ function renderProviders() {
         <div class="name">${escapeHtml(p.name)}
           ${active ? '<span class="pill ok">active</span>' : ""}
           ${!p.enabled ? '<span class="pill err">disabled</span>' : ""}
-          <span class="pill accent">${escapeHtml(p.apiBackend || "chat_completions")}</span>
+          <span class="pill accent">${escapeHtml(p.apiBackend || "responses")}</span>
           <span class="pill ${effective ? "ok" : ""}" title="代理防护：全局 ${globalOn ? "开" : "关"} · 本供应商 ${pShield ? "开" : "关"}">
             代理${effective ? "直连" : "可走代理"}
           </span>
@@ -341,7 +411,7 @@ function openProviderForm(provider) {
   form.name.value = provider?.name || "";
   form.baseUrl.value = provider?.baseUrl || "";
   form.apiKey.value = provider?.apiKey || "";
-  form.apiBackend.value = provider?.apiBackend || "chat_completions";
+  form.apiBackend.value = provider?.apiBackend || "responses";
   form.enabled.checked = provider?.enabled !== false;
   if (form.proxyShield) {
     form.proxyShield.checked = provider?.proxyShield !== false;
@@ -449,6 +519,20 @@ function renderLogs(logs) {
   for (const e of logs) {
     const statusClass =
       e.status >= 400 ? "status-err" : e.status ? "status-ok" : "";
+    const protocol =
+      e.clientProtocol && e.upstreamProtocol
+        ? `${e.clientProtocol} → ${e.upstreamProtocol}`
+        : e.clientProtocol || e.upstreamProtocol || "";
+    const errorMeta = [
+      e.errorStage,
+      e.proxyMode,
+      protocol,
+      e.streamStarted === undefined
+        ? ""
+        : `stream=${e.streamStarted ? "started" : "not-started"}`,
+    ]
+      .filter(Boolean)
+      .join(" · ");
     html += `<tr>
       <td>${fmtTime(e.ts)}</td>
       <td>${escapeHtml(e.method)}</td>
@@ -456,9 +540,17 @@ function renderLogs(logs) {
       <td><code>${escapeHtml(e.modelIn || "—")} → ${escapeHtml(e.modelOut || "—")}</code></td>
       <td>${escapeHtml(e.providerId || "—")}</td>
       <td class="${statusClass}">${e.status}${e.stream ? " ƒ" : ""}${
-        e.error ? ` (${escapeHtml(e.error)})` : ""
+        e.error
+          ? ` (${escapeHtml(e.error)})${
+              errorMeta
+                ? `<div class="hint">${escapeHtml(errorMeta)}</div>`
+                : ""
+            }`
+          : ""
       }</td>
-      <td>${e.latencyMs}</td>
+      <td title="首字节 / 完整响应">${e.firstByteMs ?? e.latencyMs}ms / ${
+        e.durationMs ?? e.latencyMs
+      }ms</td>
     </tr>`;
   }
   body.innerHTML = html;
@@ -641,6 +733,9 @@ function wire() {
         if (!r.ok) throw new Error(r.error || "fetch failed");
         state.upstreamCache[id] = r.models || [];
         fillUpstreamDatalist(r.models);
+        if (state.activeTab === "maps") {
+          renderModelQuickFill(id, r.models || []);
+        }
         const names = (r.models || []).slice(0, 16).map((m) => m.id).join("\n");
         if (
           confirm(
@@ -709,7 +804,7 @@ function wire() {
   $("#provider-form").addEventListener("submit", async (ev) => {
     ev.preventDefault();
     const form = ev.target;
-    const apiBackend = form.apiBackend.value || "chat_completions";
+    const apiBackend = form.apiBackend.value || "responses";
     const extraHeaders = {};
     if (apiBackend === "messages") {
       extraHeaders["anthropic-version"] = "2023-06-01";
@@ -763,6 +858,36 @@ function wire() {
       await refreshAll(true);
     } catch (err) {
       toast("保存失败", err.message, "err");
+    }
+  });
+
+  const mapForm = $("#map-form");
+  mapForm.to.addEventListener("focus", () => void showModelQuickFill());
+  mapForm.to.addEventListener("input", () =>
+    void showModelQuickFill({ fetchIfMissing: false }),
+  );
+  mapForm.providerId.addEventListener("input", () =>
+    void showModelQuickFill({ fetchIfMissing: false }),
+  );
+  mapForm.to.addEventListener("blur", () => {
+    setTimeout(() => $("#model-quick-fill")?.classList.add("hidden"), 120);
+  });
+
+  $("#model-quick-fill")?.addEventListener("mousedown", (ev) => {
+    ev.preventDefault();
+  });
+  onDelegatedClick("#model-quick-fill", (btn) => {
+    if (btn.dataset.act !== "quick-fill-model") return;
+    mapForm.to.value = btn.dataset.model || "";
+    $("#model-quick-fill")?.classList.add("hidden");
+    mapForm.to.focus();
+  });
+
+  $("#import-provider-maps").addEventListener("change", () => {
+    const id = $("#import-provider-maps").value;
+    fillUpstreamDatalist(state.upstreamCache[id] || []);
+    if (document.activeElement === mapForm.to) {
+      void showModelQuickFill({ fetchIfMissing: false });
     }
   });
 

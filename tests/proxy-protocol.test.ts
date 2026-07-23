@@ -1,10 +1,11 @@
-import { createServer } from "node:http";
+import { createServer, type IncomingMessage, type ServerResponse } from "node:http";
 import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
 import { ConfigStore } from "../src/server/config-store.js";
 import { createApp } from "../src/server/index.js";
+import { globalRequestLog } from "../src/lib/request-log.js";
 
 describe("proxy protocol translation", () => {
   const dirs: string[] = [];
@@ -52,6 +53,42 @@ describe("proxy protocol translation", () => {
     const addr = server.address();
     if (!addr || typeof addr === "string") throw new Error("no port");
     return { port: addr.port, received };
+  }
+
+  async function listenRaw(
+    handler: (req: IncomingMessage, res: ServerResponse) => void,
+  ): Promise<number> {
+    const server = createServer(handler);
+    servers.push(server);
+    await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve));
+    const addr = server.address();
+    if (!addr || typeof addr === "string") throw new Error("no port");
+    return addr.port;
+  }
+
+  function configureChatProvider(
+    store: ConfigStore,
+    port: number,
+    id: string,
+    requestTimeoutMs: number,
+  ): void {
+    store.update((cfg) => {
+      cfg.providers = [
+        {
+          id,
+          name: id,
+          baseUrl: `http://127.0.0.1:${port}/v1`,
+          apiKey: "sk-test",
+          apiBackend: "chat_completions",
+          modelsListUrl: null,
+          enabled: true,
+          extraHeaders: {},
+        },
+      ];
+      cfg.activeProviderId = id;
+      cfg.server.requestTimeoutMs = requestTimeoutMs;
+      return cfg;
+    });
   }
 
   it("translates chat_completions → anthropic messages with tools", async () => {
@@ -159,9 +196,21 @@ describe("proxy protocol translation", () => {
     const store = new ConfigStore({ home });
 
     const { port, received } = await listen((_req, body) => {
-      const req = JSON.parse(body) as { input?: unknown; tools?: unknown[] };
+      const req = JSON.parse(body) as { input?: Array<Record<string, unknown>>; tools?: unknown[] };
       expect(req.input).toBeTruthy();
       expect(req.tools).toBeTruthy();
+      const call = req.input?.find((i) => i.type === "function_call");
+      const result = req.input?.find((i) => i.type === "function_call_output");
+      expect(call).toMatchObject({
+        id: "fc_call_proxy_1",
+        call_id: "call_proxy_1",
+        name: "get_weather",
+        arguments: '{"city":"LA"}',
+      });
+      expect(result).toMatchObject({
+        call_id: "call_proxy_1",
+        output: '{"temp":72}',
+      });
       return {
         body: JSON.stringify({
           id: "resp_1",
@@ -205,13 +254,36 @@ describe("proxy protocol translation", () => {
       headers: { "content-type": "application/json" },
       body: JSON.stringify({
         model: "grok-4.5",
-        messages: [{ role: "user", content: "hi" }],
+        messages: [
+          { role: "user", content: "weather?" },
+          {
+            role: "assistant",
+            content: null,
+            tool_calls: [
+              {
+                id: "call_proxy_1",
+                type: "function",
+                function: {
+                  name: "get_weather",
+                  arguments: '{"city":"LA"}',
+                },
+              },
+            ],
+          },
+          {
+            role: "tool",
+            tool_call_id: "call_proxy_1",
+            content: '{"temp":72}',
+          },
+          { role: "user", content: "summarize" },
+        ],
         tools: [
           {
             type: "function",
             function: {
               name: "get_weather",
               parameters: { type: "object", properties: {} },
+              strict: true,
             },
           },
         ],
@@ -290,5 +362,116 @@ describe("proxy protocol translation", () => {
       choices: Array<{ message: { content: string } }>;
     };
     expect(json.choices[0].message.content).toBe("hello");
+  });
+
+  it("converts an upstream socket close after headers into an SSE error and DONE", async () => {
+    const home = mkdtempSync(join(tmpdir(), "gbg-stream-"));
+    dirs.push(home);
+    const store = new ConfigStore({ home });
+    const port = await listenRaw((req, res) => {
+      req.resume();
+      req.on("end", () => {
+        res.writeHead(200, { "content-type": "text/event-stream" });
+        res.write('data: {"id":"chatcmpl_stream"}\n\n');
+        setTimeout(() => res.destroy(), 10);
+      });
+    });
+    configureChatProvider(store, port, "stream-close", 500);
+
+    const resp = await createApp(store).request("/v1/chat/completions", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ model: "m", stream: true, messages: [{ role: "user", content: "hi" }] }),
+    });
+    const body = await resp.text();
+    expect(resp.status).toBe(200);
+    expect(body).toContain("upstream_stream_error");
+    expect(body).toContain("data: [DONE]");
+    const log = globalRequestLog.list(100).find((entry) => entry.providerId === "stream-close");
+    expect(log?.stream).toBe(true);
+    expect(log?.firstByteMs).toBeTypeOf("number");
+    expect(log?.durationMs).toBeGreaterThanOrEqual(log?.firstByteMs ?? 0);
+    expect(log?.errorStage).toBe("upstream_body");
+  });
+
+  it("returns structured 502 when upstream closes before response headers", async () => {
+    const home = mkdtempSync(join(tmpdir(), "gbg-stream-"));
+    dirs.push(home);
+    const store = new ConfigStore({ home });
+    const port = await listenRaw((req, res) => {
+      req.resume();
+      req.on("end", () => setTimeout(() => res.destroy(), 5));
+    });
+    configureChatProvider(store, port, "headers-close", 500);
+
+    const resp = await createApp(store).request("/v1/chat/completions", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ model: "m", messages: [{ role: "user", content: "hi" }] }),
+    });
+    const body = (await resp.json()) as { error: { message: string; errorStage?: string } };
+    expect(resp.status).toBe(502);
+    expect(body.error.message).toContain("upstream response headers unavailable");
+    const log = globalRequestLog.list(100).find((entry) => entry.providerId === "headers-close");
+    expect(log?.errorStage).toBe("upstream_headers");
+    expect(log?.streamStarted).toBe(false);
+  });
+
+  it("keeps timeout protection active until a stream finishes", async () => {
+    const home = mkdtempSync(join(tmpdir(), "gbg-stream-"));
+    dirs.push(home);
+    const store = new ConfigStore({ home });
+    const port = await listenRaw((req, res) => {
+      req.resume();
+      req.on("end", () => {
+        res.writeHead(200, { "content-type": "text/event-stream" });
+        res.write('data: {"id":"chatcmpl_slow"}\n\n');
+        setTimeout(() => res.end('data: [DONE]\n\n'), 100);
+      });
+    });
+    configureChatProvider(store, port, "stream-timeout", 25);
+
+    const resp = await createApp(store).request("/v1/chat/completions", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ model: "m", stream: true, messages: [{ role: "user", content: "hi" }] }),
+    });
+    const body = await resp.text();
+    expect(resp.status).toBe(200);
+    expect(body).toContain("upstream_timeout");
+    expect(body).toContain("data: [DONE]");
+    const log = globalRequestLog.list(100).find((entry) => entry.providerId === "stream-timeout");
+    expect(log?.status).toBe(504);
+    expect(log?.errorStage).toBe("upstream_body");
+  });
+
+  it("aborts the upstream stream and records a client cancellation", async () => {
+    const home = mkdtempSync(join(tmpdir(), "gbg-stream-"));
+    dirs.push(home);
+    const store = new ConfigStore({ home });
+    const port = await listenRaw((req, res) => {
+      req.resume();
+      req.on("end", () => {
+        res.writeHead(200, { "content-type": "text/event-stream" });
+        res.write('data: {"id":"chatcmpl_cancel"}\n\n');
+      });
+    });
+    configureChatProvider(store, port, "stream-cancel", 500);
+    const abort = new AbortController();
+    const resp = await createApp(store).request("/v1/chat/completions", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ model: "m", stream: true, messages: [{ role: "user", content: "hi" }] }),
+      signal: abort.signal,
+    });
+    const reader = resp.body?.getReader();
+    await reader?.read();
+    abort.abort();
+    await reader?.cancel();
+    await new Promise((resolve) => setTimeout(resolve, 20));
+    const log = globalRequestLog.list(100).find((entry) => entry.providerId === "stream-cancel");
+    expect(log?.status).toBe(499);
+    expect(log?.errorStage).toBe("client");
+    expect(log?.streamStarted).toBe(true);
   });
 });

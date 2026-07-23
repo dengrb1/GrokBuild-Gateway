@@ -24,6 +24,9 @@ src-tauri/target/
 src-tauri/gen/
 # Wix / NSIS intermediate (if bundle is run)
 src-tauri/WixTools/
+src-desktop-compat/target/
+# Gateway binary and version stamp embedded during the compat desktop build
+src-desktop-compat/embedded/*
 *.pdb
 
 # ── Env & secrets ─────────────────────────────────────────

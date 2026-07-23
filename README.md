@@ -1,12 +1,13 @@
 # GrokBuild Gateway (`gbg`)
 
-类似 **CC Switch** 的 **Grok Build 专用** 供应商 / 模型切换工具。
+**Grok Build 专用** 供应商 / 模型切换工具。
 
 - 多供应商档案（Okinto / CCX / xAI / Anthropic / OpenAI Responses / 自定义）
 - **模型映射**：Grok 发出的模型名 → 上游真实模型名（可按映射钉死供应商）
 - **本地网关**：Grok 固定指向 `http://127.0.0.1:8787/v1`，切换供应商 **无需重启 Grok**
-- **三协议**：`chat_completions` / `responses` / `messages` 互转（含 Tools / SSE）
-- **双产物**：`gbg.exe`（纯网关 + WebUI）+ `gbg-desktop.exe`（托盘客户端）
+- **三协议**：`chat_completions` / `responses` / `messages` 互转（新增供应商默认 `responses`，Anthropic 仍为 `messages`）
+- **Tools 修复**：Chat tools 转 Responses 时会规范 `function_call.id` / `call_id`，避免上游因 tool call 形状异常断开连接
+- **三产物**：`gbg.exe`（纯网关 + WebUI）+ `gbg-desktop.exe`（Tauri 托盘客户端）+ `gbg-desktop-compat.exe`（无 WebView2 / Win7 兼容托盘）
 - **代理盾**：强制用 `127.0.0.1`，防止系统代理把本机网关搞挂
 - **主题**：浅色 / 深色 / 跟随系统
 
@@ -23,12 +24,15 @@ Grok Build  ──►  gbg :8787  ──►  active provider (Okinto / CCX / …
                  └─ hot reload config
 ```
 
-## 两个发布产物
+## 三个发布产物
 
-| 文件 | 用途 |
-|------|------|
-| `release/gbg.exe` | 纯网关 + 内嵌 WebUI（CLI / 无托盘） |
-| `release/gbg-desktop.exe` | **单文件客户端**：内置网关 + 托盘 + 启停 + 开机自启（无需旁挂 gbg.exe） |
+| 文件 | 用途 | 系统要求 |
+|------|------|----------|
+| `release/gbg.exe` | 纯网关 + 内嵌 WebUI（CLI / 无托盘） | 与 Bun 运行时一致（通常 Win10+） |
+| `release/gbg-desktop.exe` | **单文件客户端**：内置网关 + 托盘 + 内嵌 WebView 窗口 | **需要 WebView2**（Win10/11 通常已装） |
+| `release/gbg-desktop-compat.exe` | **兼容客户端**：内置网关 + 托盘，**无 WebView2**，WebUI 用系统浏览器 | **Win7+**，无需 Edge / WebView2 |
+
+没有 WebView2、或仍在用 Windows 7 的用户请用 **`gbg-desktop-compat.exe`**。
 
 ### 打包
 
@@ -36,10 +40,13 @@ Grok Build  ──►  gbg :8787  ──►  active provider (Okinto / CCX / …
 # 仅网关（CLI）
 npm run build:exe
 
-# 桌面客户端（会先编 gbg.exe 再嵌入）
+# 标准桌面客户端（Tauri / WebView2）
 npm run build:desktop
 
-# 两者
+# 兼容桌面客户端（无 WebView2 / Win7 向）
+npm run build:desktop:compat
+
+# 全部
 npm run build:all
 ```
 
@@ -52,7 +59,7 @@ npm run build:all
 # 浏览器打开 http://127.0.0.1:8787/
 ```
 
-**桌面客户端（内置网关，单文件即可）：**
+**标准桌面客户端（内置网关 + WebView2 窗口）：**
 
 ```bash
 .\release\gbg-desktop.exe
@@ -65,11 +72,25 @@ npm run build:all
 - 依赖系统 **WebView2**（Win10/11 通常已装）
 - 可选：`--no-gateway` 只开壳不启网关；`GBG_PORT` 改端口
 
+**兼容桌面客户端（无 WebView2 / 支持 Win7）：**
+
+```bash
+.\release\gbg-desktop-compat.exe
+```
+
+- **不依赖** WebView2 / Edge 运行时；PE 子系统目标为 Windows 7（`6.01`），静态链接 CRT
+- 同样内置并自动启动网关；托盘左键打开系统默认浏览器中的 WebUI
+- 托盘右键：打开 WebUI / 启动 / 停止 / 开机自启 / 关于 / 退出
+- 参数：`--no-gateway`、`--autostart`、`--minimized`、`--no-open`
+- 环境变量：`GBG_PORT`、`GBG_EXE`（覆盖内置网关路径）、`GBG_USE_EXTERNAL=1`
+- 说明：内置 `gbg.exe` 由 Bun 编译，在极老系统上若无法启动，可用 `GBG_EXE` 指向本机 Node 启动的网关，或先 `gbg.exe serve` 再只跑壳
+
 开发模式：
 
 ```bash
-npm run dev                 # 网关
-npm run dev:desktop         # 桌面壳（需本机已有 gbg / 或先 build:exe）
+npm run dev                   # 网关
+npm run dev:desktop           # 标准桌面壳（需本机已有 gbg / 或先 build:exe）
+npm run dev:desktop:compat    # 兼容托盘壳
 ```
 
 ## 防系统代理搞挂网关（重要）
@@ -139,6 +160,8 @@ gbg fetch-models okinto
 gbg import-models okinto --target both --mode merge
 ```
 
+Web UI → 模型映射中，点击 `to（上游 id）` 输入框会显示上游模型候选；候选只来自当前供应商 `/models` 拉取结果，点击后快速填入目标模型 ID，不会自动保存映射。
+
 ## CLI
 
 | 命令 | 说明 |
@@ -159,6 +182,7 @@ gbg import-models okinto --target both --mode merge
 关键字段：
 
 - `activeProviderId` / `providers[]` / `modelMaps[]` / `virtualModels[]`
+- `providers[].apiBackend`：`responses` / `chat_completions` / `messages`；新增供应商默认 `responses`，Anthropic 默认 `messages`
 - `server.host` / `server.port`（默认 `127.0.0.1:8787`）
 - `server.proxyShield`：全局代理防护开关（默认 `true`；UI 可切换）
 - `server.proxyMode`：`direct` / `env`（与 `proxyShield` 同步，兼容旧配置）
@@ -172,6 +196,7 @@ gbg import-models okinto --target both --mode merge
 - 顶栏 **代理盾** 状态徽章
 - **总览**：全局代理防护开关
 - **供应商**：列表与编辑表单均可单独开关代理防护
+- **模型映射**：目标模型 ID 输入框支持上游模型快速填入
 
 ## Control API（摘要）
 

@@ -1,5 +1,6 @@
 import type { Protocol } from "./types.js";
 import {
+  asArray,
   asObject,
   asString,
   isObject,
@@ -62,8 +63,23 @@ type StreamState = {
   // for anthropic tool_use assembly when converting to chat
   toolIndexById: Map<string, number>;
   nextToolIndex: number;
-  // responses function call partial args
-  responsesCallArgs: Map<string, string>;
+  // Responses function calls are keyed by every identifier the provider may
+  // use for an event: call_id, item_id, item.id, and output_index.
+  responsesCalls: ResponsesCallState[];
+  responsesCallByKey: Map<string, ResponsesCallState>;
+  responsesText: string;
+  finishSent: boolean;
+  doneSent: boolean;
+};
+
+type ResponsesCallState = {
+  index: number;
+  callId: string;
+  itemId?: string;
+  outputIndex?: number;
+  name: string;
+  arguments: string;
+  emitted: boolean;
 };
 
 function newState(): StreamState {
@@ -72,7 +88,11 @@ function newState(): StreamState {
     model: "",
     toolIndexById: new Map(),
     nextToolIndex: 0,
-    responsesCallArgs: new Map(),
+    responsesCalls: [],
+    responsesCallByKey: new Map(),
+    responsesText: "",
+    finishSent: false,
+    doneSent: false,
   };
 }
 
@@ -139,7 +159,10 @@ function convertSseData(
     const chatChunks = responsesSseToChat(json, eventName, state);
     const out: string[] = [];
     for (const c of chatChunks) {
-      if (c === "[DONE]") continue;
+      if (c === "[DONE]") {
+        state.doneSent = true;
+        continue;
+      }
       try {
         const chatJson = JSON.parse(c) as JsonObject;
         out.push(...chatSseToAnthropic(chatJson, state));
@@ -296,6 +319,7 @@ function anthropicSseToChat(
     else if (stop === "max_tokens") finish = "length";
     else if (stop === "end_turn" || stop === "stop_sequence") finish = "stop";
     if (finish) {
+      state.finishSent = true;
       out.push(
         JSON.stringify({
           ...base(),
@@ -403,6 +427,7 @@ function chatSseToAnthropic(json: JsonObject, state: StreamState): string[] {
 
   const finish = choice.finish_reason;
   if (typeof finish === "string" && finish) {
+    state.finishSent = true;
     let stop = "end_turn";
     if (finish === "tool_calls") stop = "tool_use";
     else if (finish === "length") stop = "max_tokens";
@@ -413,6 +438,7 @@ function chatSseToAnthropic(json: JsonObject, state: StreamState): string[] {
       }),
     );
     out.push(JSON.stringify({ type: "message_stop" }));
+    state.doneSent = true;
   }
 
   return out;
@@ -444,6 +470,82 @@ function asContentBlocks(msg: JsonObject): string[] {
   return out;
 }
 
+function responseCallKeys(payload: JsonObject, item: JsonObject): string[] {
+  const keys: string[] = [];
+  const add = (prefix: string, value: unknown) => {
+    if (typeof value === "string" && value) keys.push(`${prefix}:${value}`);
+  };
+  add("call", payload.call_id);
+  add("call", item.call_id);
+  add("item", payload.item_id);
+  add("item", item.item_id);
+  add("item", item.id);
+  const outputIndex =
+    typeof payload.output_index === "number"
+      ? payload.output_index
+      : typeof item.output_index === "number"
+        ? item.output_index
+        : undefined;
+  if (outputIndex !== undefined) keys.push(`output:${outputIndex}`);
+  return keys;
+}
+
+function registerResponseCall(
+  state: StreamState,
+  payload: JsonObject,
+  item: JsonObject = asObject(payload.item),
+): ResponsesCallState {
+  const keys = responseCallKeys(payload, item);
+  let call: ResponsesCallState | undefined;
+  for (const key of keys) {
+    call = state.responsesCallByKey.get(key);
+    if (call) break;
+  }
+
+  const itemId = asString(item.id || payload.item_id) || undefined;
+  const outputIndex =
+    typeof payload.output_index === "number"
+      ? payload.output_index
+      : typeof item.output_index === "number"
+        ? item.output_index
+        : undefined;
+  const explicitCallId = asString(payload.call_id || item.call_id);
+  const callId = explicitCallId || itemId || asString(payload.item_id);
+
+  if (!call) {
+    call = {
+      index: state.nextToolIndex++,
+      callId: callId || newId("call"),
+      itemId,
+      outputIndex,
+      name: asString(item.name || payload.name),
+      arguments: "",
+      emitted: false,
+    };
+    state.responsesCalls.push(call);
+  } else {
+    if (explicitCallId) call.callId = explicitCallId;
+    if (itemId) call.itemId = itemId;
+    if (outputIndex !== undefined) call.outputIndex = outputIndex;
+    const name = asString(item.name || payload.name);
+    if (name) call.name = name;
+  }
+
+  for (const key of keys) state.responsesCallByKey.set(key, call);
+  state.responsesCallByKey.set(`call:${call.callId}`, call);
+  if (call.itemId) state.responsesCallByKey.set(`item:${call.itemId}`, call);
+  if (call.outputIndex !== undefined) {
+    state.responsesCallByKey.set(`output:${call.outputIndex}`, call);
+  }
+  return call;
+}
+
+function responsesFunctionCallItemId(callId: string): string {
+  if (callId.startsWith("fc_")) return callId;
+  const safe = callId.replace(/[^A-Za-z0-9_-]/g, "_").slice(0, 80);
+  return `fc_${safe || newId("call")}`;
+}
+
 function responsesSseToChat(
   json: JsonObject,
   eventName: string | undefined,
@@ -457,6 +559,130 @@ function responsesSseToChat(
     created: Math.floor(Date.now() / 1000),
     model: state.model || asString(json.model, ""),
   });
+
+  const textDelta = (text: string): void => {
+    if (!text) return;
+    state.responsesText += text;
+    out.push(
+      JSON.stringify({
+        ...base(),
+        choices: [
+          {
+            index: 0,
+            delta: { content: text },
+            finish_reason: null,
+          },
+        ],
+      }),
+    );
+  };
+
+  const argumentDelta = (
+    call: ResponsesCallState,
+    raw: unknown,
+    final: boolean,
+  ): void => {
+    if (raw === undefined || raw === null) return;
+    const next =
+      typeof raw === "string" ? raw : stringifyToolArguments(raw);
+    if (!next) return;
+    let delta = next;
+    if (final) {
+      if (next === call.arguments || call.arguments.startsWith(next)) return;
+      delta = next.startsWith(call.arguments)
+        ? next.slice(call.arguments.length)
+        : next;
+      call.arguments = next;
+    } else {
+      call.arguments += next;
+    }
+    if (!delta) return;
+    out.push(
+      JSON.stringify({
+        ...base(),
+        choices: [
+          {
+            index: 0,
+            delta: {
+              tool_calls: [
+                {
+                  index: call.index,
+                  function: { arguments: delta },
+                },
+              ],
+            },
+            finish_reason: null,
+          },
+        ],
+      }),
+    );
+  };
+
+  const callStart = (call: ResponsesCallState): void => {
+    if (call.emitted) return;
+    call.emitted = true;
+    out.push(
+      JSON.stringify({
+        ...base(),
+        choices: [
+          {
+            index: 0,
+            delta: {
+              tool_calls: [
+                {
+                  index: call.index,
+                  id: call.callId,
+                  type: "function",
+                  function: { name: call.name, arguments: "" },
+                },
+              ],
+            },
+            finish_reason: null,
+          },
+        ],
+      }),
+    );
+  };
+
+  const emitFinalOutput = (payload: JsonObject): void => {
+    const response = asObject(payload.response);
+    const output = Array.isArray(response.output)
+      ? response.output
+      : Array.isArray(payload.output)
+        ? payload.output
+        : [];
+    output.forEach((rawItem, outputIndex) => {
+      if (!isObject(rawItem)) return;
+      const item = rawItem;
+      const itemType = asString(item.type);
+      if (itemType === "function_call") {
+        const call = registerResponseCall(
+          state,
+          { ...item, output_index: outputIndex },
+          item,
+        );
+        callStart(call);
+        argumentDelta(call, item.arguments, true);
+      } else if (itemType === "message") {
+        for (const part of asArray(item.content)) {
+          if (!isObject(part)) continue;
+          if (asString(part.type) === "output_text" || asString(part.type) === "text") {
+            const text = asString(part.text);
+            const delta = text.startsWith(state.responsesText)
+              ? text.slice(state.responsesText.length)
+              : text;
+            textDelta(delta);
+          }
+        }
+      } else if (itemType === "output_text") {
+        const text = asString(item.text);
+        const delta = text.startsWith(state.responsesText)
+          ? text.slice(state.responsesText.length)
+          : text;
+        textDelta(delta);
+      }
+    });
+  };
 
   if (type === "response.created" || type === "response.in_progress") {
     const resp = asObject(json.response);
@@ -481,52 +707,18 @@ function responsesSseToChat(
     type === "response.output_text.delta" ||
     type === "response.text.delta"
   ) {
-    out.push(
-      JSON.stringify({
-        ...base(),
-        choices: [
-          {
-            index: 0,
-            delta: { content: asString(json.delta ?? json.text) },
-            finish_reason: null,
-          },
-        ],
-      }),
-    );
+    textDelta(asString(json.delta ?? json.text));
     return out;
   }
 
-  if (type === "response.output_item.added") {
+  if (type === "response.output_item.added" || type === "response.output_item.done") {
     const item = asObject(json.item);
     if (asString(item.type) === "function_call") {
-      const idx = state.nextToolIndex++;
-      const id = asString(item.call_id || item.id, newId("call"));
-      state.toolIndexById.set(id, idx);
-      state.responsesCallArgs.set(id, "");
-      out.push(
-        JSON.stringify({
-          ...base(),
-          choices: [
-            {
-              index: 0,
-              delta: {
-                tool_calls: [
-                  {
-                    index: idx,
-                    id,
-                    type: "function",
-                    function: {
-                      name: asString(item.name),
-                      arguments: "",
-                    },
-                  },
-                ],
-              },
-              finish_reason: null,
-            },
-          ],
-        }),
-      );
+      const call = registerResponseCall(state, json, item);
+      callStart(call);
+      if (type === "response.output_item.done") {
+        argumentDelta(call, item.arguments, true);
+      }
     }
     return out;
   }
@@ -535,83 +727,64 @@ function responsesSseToChat(
     type === "response.function_call_arguments.delta" ||
     type === "response.output_item.delta"
   ) {
-    const callId = asString(
-      json.call_id ?? asObject(json.item).call_id ?? asObject(json.item).id,
-    );
-    const idx = state.toolIndexById.get(callId) ?? 0;
-    const deltaArgs = asString(
-      json.delta ??
-        asObject(json.delta).arguments ??
-        asObject(json.item).arguments,
-    );
-    if (deltaArgs) {
+    const item = asObject(json.item);
+    const call = registerResponseCall(state, json, item);
+    callStart(call);
+    const delta = asObject(json.delta);
+    const deltaArgs =
+      typeof json.delta === "string"
+        ? json.delta
+        : delta.arguments ?? item.arguments;
+    argumentDelta(call, deltaArgs, false);
+    return out;
+  }
+
+  if (type === "response.function_call_arguments.done") {
+    const item = asObject(json.item);
+    const call = registerResponseCall(state, json, item);
+    callStart(call);
+    argumentDelta(call, json.arguments ?? item.arguments, true);
+    return out;
+  }
+
+  if (type === "response.completed" || type === "response.done") {
+    emitFinalOutput(json);
+    if (!state.finishSent) {
+      state.finishSent = true;
+      const status = asString(asObject(json.response).status);
       out.push(
         JSON.stringify({
           ...base(),
           choices: [
             {
               index: 0,
-              delta: {
-                tool_calls: [
-                  {
-                    index: idx,
-                    function: { arguments: deltaArgs },
-                  },
-                ],
-              },
-              finish_reason: null,
+              delta: {},
+              finish_reason:
+                state.responsesCalls.length > 0
+                  ? "tool_calls"
+                  : status === "incomplete"
+                    ? "length"
+                    : "stop",
             },
           ],
         }),
       );
     }
+    if (!state.doneSent) {
+      out.push("[DONE]");
+    }
     return out;
   }
 
-  if (type === "response.function_call_arguments.done") {
-    // no-op for chat; args already streamed
-    return out;
-  }
-
-  if (type === "response.completed" || type === "response.done") {
-    const resp = asObject(json.response);
-    // detect tool calls in final output if we never streamed them
-    const hasTools = state.toolIndexById.size > 0;
-    out.push(
-      JSON.stringify({
-        ...base(),
-        choices: [
-          {
-            index: 0,
-            delta: {},
-            finish_reason: hasTools ? "tool_calls" : "stop",
-          },
-        ],
-      }),
-    );
-    out.push("[DONE]");
-    void resp;
-    return out;
+  if (Array.isArray(json.output) || Array.isArray(asObject(json.response).output)) {
+    emitFinalOutput(json);
   }
 
   // content part text
   if (type === "response.content_part.delta") {
     const delta = asObject(json.delta);
     const text = asString(delta.text ?? json.delta);
-    if (text) {
-      out.push(
-        JSON.stringify({
-          ...base(),
-          choices: [
-            {
-              index: 0,
-              delta: { content: text },
-              finish_reason: null,
-            },
-          ],
-        }),
-      );
-    }
+    textDelta(text);
   }
 
   return out;
@@ -654,16 +827,21 @@ function chatSseToResponses(json: JsonObject, state: StreamState): string[] {
     const call = asObject(tc);
     const fn = asObject(call.function);
     const idx = typeof call.index === "number" ? call.index : 0;
+    const callId = asString(call.id, newId("call"));
+    const itemId = responsesFunctionCallItemId(callId);
     if (call.id || fn.name) {
-      const id = asString(call.id, newId("call"));
-      state.toolIndexById.set(String(idx), idx);
+      registerResponseCall(
+        state,
+        { call_id: callId, item_id: itemId, output_index: idx, name: asString(fn.name) },
+        { type: "function_call", id: itemId, call_id: callId, name: asString(fn.name) },
+      );
       out.push(
         JSON.stringify({
           type: "response.output_item.added",
           item: {
             type: "function_call",
-            id,
-            call_id: id,
+            id: itemId,
+            call_id: callId,
             name: asString(fn.name),
             arguments: "",
           },
@@ -675,7 +853,9 @@ function chatSseToResponses(json: JsonObject, state: StreamState): string[] {
         JSON.stringify({
           type: "response.function_call_arguments.delta",
           call_id: asString(call.id),
-          delta: asString(fn.arguments),
+          item_id: itemId,
+          output_index: idx,
+          delta: stringifyToolArguments(fn.arguments),
         }),
       );
     }
@@ -683,21 +863,109 @@ function chatSseToResponses(json: JsonObject, state: StreamState): string[] {
 
   const finish = choice.finish_reason;
   if (typeof finish === "string" && finish) {
-    out.push(
-      JSON.stringify({
-        type: "response.completed",
-        response: {
-          id: respId,
-          object: "response",
-          status: "completed",
-          model: state.model,
-        },
-      }),
-    );
-    out.push("[DONE]");
+    if (!state.finishSent) {
+      state.finishSent = true;
+      out.push(
+        JSON.stringify({
+          type: "response.completed",
+          response: {
+            id: respId,
+            object: "response",
+            status: "completed",
+            model: state.model,
+          },
+        }),
+      );
+    }
+    if (!state.doneSent) {
+      out.push("[DONE]");
+    }
   }
 
   return out;
+}
+
+function terminalPayloads(state: StreamState, to: Protocol): string[] {
+  const out: string[] = [];
+  if (!state.finishSent) {
+    state.finishSent = true;
+    if (to === "chat_completions") {
+      out.push(
+        JSON.stringify({
+          id: state.id,
+          object: "chat.completion.chunk",
+          created: Math.floor(Date.now() / 1000),
+          model: state.model,
+          choices: [
+            {
+              index: 0,
+              delta: {},
+              finish_reason: state.responsesCalls.length
+                ? "tool_calls"
+                : "stop",
+            },
+          ],
+        }),
+      );
+    } else if (to === "responses") {
+      out.push(
+        JSON.stringify({
+          type: "response.completed",
+          response: {
+            id: state.id.replace(/^chatcmpl/, "resp"),
+            object: "response",
+            status: "completed",
+            model: state.model,
+          },
+        }),
+      );
+    } else if (to === "messages") {
+      out.push(
+        JSON.stringify({
+          type: "message_delta",
+          delta: {
+            stop_reason: state.responsesCalls.length ? "tool_use" : "end_turn",
+          },
+        }),
+      );
+    }
+  }
+  if (to === "messages") {
+    if (!state.doneSent) {
+      state.doneSent = true;
+      out.push(JSON.stringify({ type: "message_stop" }));
+    }
+  } else if (!state.doneSent) {
+    state.doneSent = true;
+    out.push("[DONE]");
+  }
+  return out;
+}
+
+/** Build a protocol-shaped terminal SSE error for a stream that already has headers. */
+export function protocolStreamErrorSse(
+  protocol: Protocol,
+  message: string,
+  code = "upstream_error",
+): string {
+  const error = {
+    type: "api_error",
+    message,
+    code,
+  };
+  if (protocol === "messages") {
+    return (
+      encodeSse(JSON.stringify({ type: "error", error }), "error") +
+      encodeSse(JSON.stringify({ type: "message_stop" }), "message_stop")
+    );
+  }
+  if (protocol === "responses") {
+    return (
+      encodeSse(JSON.stringify({ type: "error", error }), "error") +
+      encodeSse("[DONE]")
+    );
+  }
+  return encodeSse(JSON.stringify({ error })) + encodeSse("[DONE]");
 }
 
 /**
@@ -736,7 +1004,10 @@ export function transformSseStream(
             );
             for (const p of payloads) {
               if (p === "[DONE]") {
-                controller.enqueue(encoder.encode(encodeSse("[DONE]")));
+                if (!state.doneSent) {
+                  state.doneSent = true;
+                  controller.enqueue(encoder.encode(encodeSse("[DONE]")));
+                }
               } else {
                 // Anthropic client expects event: lines for messages protocol
                 const eventName =
@@ -762,14 +1033,27 @@ export function transformSseStream(
               state,
             );
             for (const p of payloads) {
-              const eventName =
-                to === "messages" ? (safeEventName(p) ?? undefined) : undefined;
-              controller.enqueue(encoder.encode(encodeSse(p, eventName)));
+              if (p === "[DONE]") {
+                if (!state.doneSent) {
+                  state.doneSent = true;
+                  controller.enqueue(encoder.encode(encodeSse("[DONE]")));
+                }
+              } else {
+                const eventName =
+                  to === "messages" ? (safeEventName(p) ?? undefined) : undefined;
+                controller.enqueue(encoder.encode(encodeSse(p, eventName)));
+              }
             }
           }
         }
-        if (to === "chat_completions" || to === "responses") {
-          // ensure DONE if stream ended without it
+        for (const p of terminalPayloads(state, to)) {
+          if (p === "[DONE]") {
+            controller.enqueue(encoder.encode(encodeSse("[DONE]")));
+          } else {
+            const eventName =
+              to === "messages" ? (safeEventName(p) ?? undefined) : undefined;
+            controller.enqueue(encoder.encode(encodeSse(p, eventName)));
+          }
         }
         controller.close();
       } catch (err) {

@@ -74,6 +74,12 @@ function contentToText(content: unknown): string {
   return String(content);
 }
 
+function responsesFunctionCallItemId(callId: string): string {
+  if (callId.startsWith("fc_")) return callId;
+  const safe = callId.replace(/[^A-Za-z0-9_-]/g, "_").slice(0, 80);
+  return `fc_${safe || newId("call")}`;
+}
+
 /** Merge consecutive same-role messages (Anthropic requirement for tool results). */
 function mergeAnthropicMessages(messages: JsonObject[]): JsonObject[] {
   const out: JsonObject[] = [];
@@ -301,7 +307,7 @@ export function chatRequestToResponses(body: JsonObject): JsonObject {
         const callId = asString(call.id, newId("call"));
         input.push({
           type: "function_call",
-          id: callId,
+          id: responsesFunctionCallItemId(callId),
           call_id: callId,
           name: asString(fn.name || call.name),
           arguments: stringifyToolArguments(fn.arguments ?? call.arguments),

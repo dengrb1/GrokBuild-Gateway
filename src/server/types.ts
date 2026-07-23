@@ -12,7 +12,7 @@ export const ProviderSchema = z.object({
   name: z.string().min(1),
   baseUrl: z.string().url(),
   apiKey: z.string().default(""),
-  apiBackend: ApiBackendSchema.default("chat_completions"),
+  apiBackend: ApiBackendSchema.default("responses"),
   modelsListUrl: z.string().url().nullable().optional().default(null),
   enabled: z.boolean().default(true),
   extraHeaders: z.record(z.string()).default({}),
@@ -111,7 +111,21 @@ export interface RequestLogEntry {
   modelOut: string | null;
   providerId: string | null;
   status: number;
+  /** Backward-compatible alias for the time until upstream response headers. */
   latencyMs: number;
+  /** Time spent serializing/parsing and preparing the upstream request body. */
+  requestBodyMs?: number;
+  /** Time spent waiting for the upstream response headers after fetch started. */
+  upstreamHeadersMs?: number;
+  /** End-to-end time until the upstream response headers became available. */
+  firstByteMs?: number;
+  /** End-to-end time until the complete response/stream finished. */
+  durationMs?: number;
+  clientProtocol?: ApiBackend | null;
+  upstreamProtocol?: ApiBackend;
+  proxyMode?: "direct" | "env";
+  errorStage?: string;
+  streamStarted?: boolean;
   error?: string;
   stream?: boolean;
 }
@@ -141,7 +155,7 @@ export function createDefaultConfig(): GbgConfig {
         name: "Okinto",
         baseUrl: "https://api.okinto.com/v1",
         apiKey: "env:OKINTO_API_KEY",
-        apiBackend: "chat_completions",
+        apiBackend: "responses",
         modelsListUrl: null,
         enabled: true,
         proxyShield: true,
@@ -152,7 +166,7 @@ export function createDefaultConfig(): GbgConfig {
         name: "CCX",
         baseUrl: "https://ccx.dengrb.top/v1",
         apiKey: "env:CCX_API_KEY",
-        apiBackend: "chat_completions",
+        apiBackend: "responses",
         modelsListUrl: null,
         enabled: true,
         proxyShield: true,
@@ -163,7 +177,7 @@ export function createDefaultConfig(): GbgConfig {
         name: "xAI Official",
         baseUrl: "https://api.x.ai/v1",
         apiKey: "env:XAI_API_KEY",
-        apiBackend: "chat_completions",
+        apiBackend: "responses",
         modelsListUrl: null,
         enabled: true,
         proxyShield: true,

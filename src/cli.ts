@@ -140,7 +140,7 @@ provider
       const mark = p.id === cfg.activeProviderId ? "*" : " ";
       const en = p.enabled ? "" : " [disabled]";
       console.log(
-        `${mark} ${p.id.padEnd(16)} ${(p.apiBackend ?? "chat_completions").padEnd(18)} ${p.name.padEnd(18)} ${p.baseUrl}  key=${maskSecret(p.apiKey)}${en}`,
+        `${mark} ${p.id.padEnd(16)} ${(p.apiBackend ?? "responses").padEnd(18)} ${p.name.padEnd(18)} ${p.baseUrl}  key=${maskSecret(p.apiKey)}${en}`,
       );
     }
   });
@@ -184,7 +184,7 @@ provider
   .option(
     "--backend <backend>",
     "chat_completions | responses | messages",
-    "chat_completions",
+    "responses",
   )
   .action((opts: {
     id: string;

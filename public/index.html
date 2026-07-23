@@ -139,8 +139,8 @@
               <label class="full">API Key <input name="apiKey" placeholder="env:MY_API_KEY 或 sk-…" /></label>
               <label>API Backend
                 <select name="apiBackend">
-                  <option value="chat_completions">chat_completions (OpenAI)</option>
                   <option value="responses">responses (OpenAI Responses)</option>
+                  <option value="chat_completions">chat_completions (OpenAI)</option>
                   <option value="messages">messages (Anthropic)</option>
                 </select>
               </label>
@@ -193,6 +193,7 @@
               <input name="providerId" placeholder="provider（可选）" />
               <button type="submit" class="btn primary">保存映射</button>
             </form>
+            <div id="model-quick-fill" class="model-quick-fill hidden"></div>
             <datalist id="upstream-model-list"></datalist>
           </div>
         </section>
@@ -258,7 +259,7 @@
                     <th>In → Out</th>
                     <th>Provider</th>
                     <th>Status</th>
-                    <th>ms</th>
+                    <th>TTFB / Total</th>
                   </tr>
                 </thead>
                 <tbody id="log-body"></tbody>

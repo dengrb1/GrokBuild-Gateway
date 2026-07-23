@@ -12,6 +12,12 @@ import {
 } from "./types.js";
 import { stringifyToolArguments } from "./tools.js";
 
+function responsesFunctionCallItemId(callId: string): string {
+  if (callId.startsWith("fc_")) return callId;
+  const safe = callId.replace(/[^A-Za-z0-9_-]/g, "_").slice(0, 80);
+  return `fc_${safe || newId("call")}`;
+}
+
 function usageFromAnthropic(usage: unknown): JsonObject | undefined {
   if (!isObject(usage)) return undefined;
   const prompt = asNumber(usage.input_tokens) ?? 0;
@@ -245,13 +251,13 @@ export function chatResponseToResponses(body: JsonObject): JsonObject {
   for (const tc of asArray(message.tool_calls)) {
     const call = asObject(tc);
     const fn = asObject(call.function);
-    const id = asString(call.id, newId("call"));
+    const callId = asString(call.id, newId("call"));
     output.push({
       type: "function_call",
-      id,
-      call_id: id,
+      id: responsesFunctionCallItemId(callId),
+      call_id: callId,
       name: asString(fn.name),
-      arguments: asString(fn.arguments, "{}"),
+      arguments: stringifyToolArguments(fn.arguments),
       status: "completed",
     });
   }
