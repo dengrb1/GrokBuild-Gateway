@@ -7,7 +7,7 @@ import {
 } from "node:fs";
 import { join } from "node:path";
 import type { GbgConfig, VirtualModel } from "../server/types.js";
-import { getGbgHome, getGrokConfigPath } from "./paths.js";
+import { getBackupDir, getGrokConfigPath } from "./paths.js";
 import { buildGrokBootstrapSnippet } from "./bootstrap-snippet.js";
 import { gatewayBaseUrl } from "./proxy-shield.js";
 
@@ -127,7 +127,7 @@ export function applyGrokConfig(
   const snippet = buildGrokBootstrapSnippet(cfg);
 
   const backupDir =
-    options.backupDir ?? join(getGbgHome(), "backups");
+    options.backupDir ?? getBackupDir();
   mkdirSync(backupDir, { recursive: true });
 
   let original = "";

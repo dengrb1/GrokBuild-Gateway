@@ -12,6 +12,7 @@ import {
 } from "./types.js";
 import { globalRequestLog } from "../lib/request-log.js";
 import { getActiveProvider, upsertModelMap, removeModelMap } from "../lib/model-map.js";
+import { listProviderHealth } from "../lib/provider-health.js";
 import {
   buildIdentityMaps,
   fetchUpstreamModels,
@@ -102,9 +103,27 @@ export function createControlApi(store: ConfigStore): Hono {
       host: cfg.server.host,
       publicBase,
       configPath: store.path,
+      dataHome: store.gbgHome,
       proxyShield: shieldInfo,
+      failover: cfg.server.failover ?? null,
+      providerHealth: listProviderHealth(),
     });
   });
+
+  api.get("/failover", (c) => {
+    const cfg = store.get();
+    return c.json({
+      failover: cfg.server.failover ?? {
+        enabled: true,
+        maxAttempts: 3,
+        firstByteTimeoutMs: 30000,
+        cooldownMs: 60000,
+        consecutiveFailures: 2,
+      },
+      providerHealth: listProviderHealth(),
+    });
+  });
+
 
   /**
    * Single round-trip for the Web UI poller.
@@ -163,7 +182,10 @@ export function createControlApi(store: ConfigStore): Hono {
         host: cfg.server.host,
         publicBase: base,
         configPath: store.path,
+        dataHome: store.gbgHome,
         proxyShield: shieldInfo,
+        failover: cfg.server.failover ?? null,
+        providerHealth: listProviderHealth(),
       },
       config: store.redact(),
       stats: globalRequestLog.stats(),
@@ -184,6 +206,41 @@ export function createControlApi(store: ConfigStore): Hono {
   });
 
   api.get("/config", (c) => c.json(store.redact()));
+
+  api.get("/config/backups", (c) => {
+    return c.json({ backups: store.listBackups() });
+  });
+
+  const ResetBody = z.object({
+    mode: z.enum(["defaults", "backup"]).default("defaults"),
+    backup: z.string().optional(),
+  });
+
+  /** Restore factory defaults or a previous backup (current file is backed up first). */
+  api.post("/config/reset", async (c) => {
+    try {
+      const body = ResetBody.parse((await c.req.json().catch(() => ({}))) || {});
+      const result =
+        body.mode === "backup"
+          ? store.restoreFromBackup(body.backup)
+          : store.resetToDefaults();
+      return c.json({
+        ok: true,
+        mode: result.mode,
+        backupPath: result.backupPath,
+        restoredFrom: result.restoredFrom ?? null,
+        config: store.redact(),
+        message:
+          result.mode === "defaults"
+            ? "已还原为默认配置"
+            : `已从备份还原: ${result.restoredFrom}`,
+      });
+    } catch (err) {
+      const message = err instanceof Error ? err.message : String(err);
+      return c.json({ ok: false, error: message }, 400);
+    }
+  });
+
 
   /** Toggle global proxy shield (master switch). */
   api.get("/proxy-shield", (c) => {

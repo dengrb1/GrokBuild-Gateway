@@ -46,8 +46,18 @@ describe("upstream model helpers", () => {
       { providerId: "ccx" },
     );
     expect(maps).toEqual([
-      { from: "m1", to: "m1", providerId: "ccx" },
-      { from: "m2", to: "m2", providerId: "ccx" },
+      {
+        from: "m1",
+        to: "m1",
+        providerId: "ccx",
+        candidates: [{ providerId: "ccx", model: "m1", enabled: true }],
+      },
+      {
+        from: "m2",
+        to: "m2",
+        providerId: "ccx",
+        candidates: [{ providerId: "ccx", model: "m2", enabled: true }],
+      },
     ]);
 
     const merged = mergeModelMaps(

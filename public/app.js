@@ -259,6 +259,7 @@ function renderDashboard() {
     <dt>Listen</dt><dd>${escapeHtml(publicBase)}</dd>
     <dt>Proxy</dt><dd>全局防护 ${globalOn ? "开" : "关"} · mode=${escapeHtml(proxyMode)} · 本机 127.0.0.1 始终直连</dd>
     <dt>Config</dt><dd>${escapeHtml(health.configPath || "")}</dd>
+    <dt>Data</dt><dd>${escapeHtml(health.dataHome || "")}</dd>
     <dt>Providers</dt><dd>${config.providers.length}</dd>`;
 
   const pb = $("#proxy-badge");
@@ -425,6 +426,58 @@ function closeProviderForm() {
   $("#provider-form").id.disabled = false;
 }
 
+function formatCandidates(m) {
+  const list = (m.candidates || []).filter((c) => c && c.model);
+  if (!list.length) {
+    return m.providerId
+      ? `<span class="pill accent">${escapeHtml(m.providerId)}</span>`
+      : '<span class="pill">active</span>';
+  }
+  return list
+    .map((c) => {
+      const disabled = c.enabled === false ? "!" : "";
+      const pid = c.providerId || "active";
+      return `<span class="pill ${c.enabled === false ? "" : "accent"}">${escapeHtml(
+        disabled + pid + ":" + c.model,
+      )}</span>`;
+    })
+    .join(" ");
+}
+
+function candidatesToText(m) {
+  const list = m.candidates || [];
+  if (!list.length) {
+    if (m.providerId || m.to) return `${m.providerId || ""}:${m.to || ""}`.replace(/^:/, "");
+    return "";
+  }
+  return list
+    .map((c) => `${c.providerId || ""}:${c.model || ""}`)
+    .join("\n");
+}
+
+function parseCandidatesText(text, fallbackProvider, fallbackModel) {
+  const lines = String(text || "")
+    .split(/[\n,]/)
+    .map((s) => s.trim())
+    .filter(Boolean);
+  if (!lines.length) return [];
+  return lines.map((part) => {
+    const idx = part.indexOf(":");
+    if (idx === -1) {
+      return {
+        providerId: fallbackProvider || "",
+        model: part,
+        enabled: true,
+      };
+    }
+    return {
+      providerId: part.slice(0, idx).trim(),
+      model: part.slice(idx + 1).trim(),
+      enabled: true,
+    };
+  });
+}
+
 function renderMaps() {
   const cfg = state.config;
   if (!cfg) return;
@@ -438,7 +491,7 @@ function renderMaps() {
     html += `<tr>
       <td><code>${escapeHtml(m.from)}</code></td>
       <td><code>${escapeHtml(m.to)}</code></td>
-      <td>${m.providerId ? `<span class="pill accent">${escapeHtml(m.providerId)}</span>` : '<span class="pill">active</span>'}</td>
+      <td>${formatCandidates(m)}</td>
       <td><div class="row">
         <button class="btn sm" data-act="edit" data-from="${escapeAttr(m.from)}">编辑</button>
         <button class="btn sm danger" data-act="del" data-from="${escapeAttr(m.from)}">删除</button>
@@ -523,6 +576,14 @@ function renderLogs(logs) {
       e.clientProtocol && e.upstreamProtocol
         ? `${e.clientProtocol} → ${e.upstreamProtocol}`
         : e.clientProtocol || e.upstreamProtocol || "";
+    const attemptMeta = Array.isArray(e.attempts) && e.attempts.length
+      ? e.attempts
+          .map((a) => {
+            if (a.skipped) return `${a.providerId}:skip`;
+            return `${a.providerId}${a.status ? ":" + a.status : ""}`;
+          })
+          .join(" > ")
+      : "";
     const errorMeta = [
       e.errorStage,
       e.proxyMode,
@@ -530,6 +591,7 @@ function renderLogs(logs) {
       e.streamStarted === undefined
         ? ""
         : `stream=${e.streamStarted ? "started" : "not-started"}`,
+      attemptMeta ? `tries=${attemptMeta}` : "",
     ]
       .filter(Boolean)
       .join(" · ");
@@ -636,7 +698,50 @@ function wire() {
     if (!document.hidden) void refreshAll(false);
   });
 
-  $("#btn-copy-bootstrap").addEventListener("click", async () => {
+  
+  $("#btn-reset-config")?.addEventListener("click", async () => {
+    if (
+      !confirm(
+        "将当前配置备份后，还原为出厂默认配置？\n供应商密钥等自定义内容会丢失（可从 backups 恢复）。",
+      )
+    ) {
+      return;
+    }
+    try {
+      const r = await api("/api/config/reset", {
+        method: "POST",
+        body: JSON.stringify({ mode: "defaults" }),
+      });
+      toast(
+        "已还原默认配置",
+        `${r.message || ""}${r.backupPath ? "\n备份: " + r.backupPath : ""}`,
+        "ok",
+      );
+      await refreshAll(true);
+    } catch (err) {
+      toast("还原失败", err.message, "err");
+    }
+  });
+
+  $("#btn-restore-backup")?.addEventListener("click", async () => {
+    if (!confirm("将当前配置备份后，从最近一次备份还原？")) return;
+    try {
+      const r = await api("/api/config/reset", {
+        method: "POST",
+        body: JSON.stringify({ mode: "backup" }),
+      });
+      toast(
+        "已从备份还原",
+        `${r.message || ""}${r.restoredFrom ? "\n来源: " + r.restoredFrom : ""}`,
+        "ok",
+      );
+      await refreshAll(true);
+    } catch (err) {
+      toast("还原失败", err.message, "err");
+    }
+  });
+
+$("#btn-copy-bootstrap").addEventListener("click", async () => {
     const text = $("#bootstrap-snippet").textContent;
     try {
       await navigator.clipboard.writeText(text);
@@ -775,6 +880,7 @@ function wire() {
         form.from.value = m.from;
         form.to.value = m.to;
         form.providerId.value = m.providerId || "";
+        if (form.candidates) form.candidates.value = candidatesToText(m);
         form.from.focus();
       }
     } catch (err) {
@@ -843,10 +949,19 @@ function wire() {
   $("#map-form").addEventListener("submit", async (ev) => {
     ev.preventDefault();
     const form = ev.target;
+    const from = form.from.value.trim();
+    const to = form.to.value.trim();
+    const providerId = form.providerId.value.trim() || null;
+    const candidates = parseCandidatesText(
+      form.candidates?.value || "",
+      providerId || "",
+      to,
+    );
     const entry = {
-      from: form.from.value.trim(),
-      to: form.to.value.trim(),
-      providerId: form.providerId.value.trim() || null,
+      from,
+      to,
+      providerId,
+      candidates,
     };
     try {
       await api("/api/model-maps", {
@@ -854,6 +969,7 @@ function wire() {
         body: JSON.stringify(entry),
       });
       form.reset();
+      if (form.candidates) form.candidates.value = "";
       toast("映射已保存", `${entry.from} → ${entry.to}`, "ok");
       await refreshAll(true);
     } catch (err) {

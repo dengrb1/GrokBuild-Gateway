@@ -70,6 +70,7 @@ program
     console.log(`  OpenAI API ${publicBase}/v1`);
     console.log(`  Control    ${publicBase}/api`);
     console.log(`  Config     ${store.path}`);
+    console.log(`  Data       ${store.gbgHome}`);
     console.log(`  Active     ${cfg.activeProviderId}`);
     console.log(
       `  Proxy      global=${isGlobalProxyShieldOn(cfg.server) ? "on" : "off"}` +
@@ -115,7 +116,14 @@ program
     console.log(`Maps:     ${cfg.modelMaps.length}`);
     for (const m of cfg.modelMaps) {
       const pin = m.providerId ? ` @${m.providerId}` : "";
-      console.log(`  ${m.from} → ${m.to}${pin}`);
+      const chain =
+        m.candidates && m.candidates.length > 1
+          ? ` [${m.candidates
+              .filter((c) => c.enabled !== false)
+              .map((c) => `${c.providerId || "active"}:${c.model}`)
+              .join(" | ")}]`
+          : "";
+      console.log(`  ${m.from} → ${m.to}${pin}${chain}`);
     }
     console.log(`Virtual:  ${cfg.virtualModels.map((m) => m.id).join(", ") || "(none)"}`);
     if (live) {
@@ -302,22 +310,60 @@ mapCmd
     }
     for (const m of maps) {
       const pin = m.providerId ? ` provider=${m.providerId}` : "";
-      console.log(`${m.from} → ${m.to}${pin}`);
+      const chain =
+        m.candidates && m.candidates.length
+          ? ` candidates=${m.candidates
+              .map(
+                (c) =>
+                  `${c.enabled === false ? "!" : ""}${c.providerId || "active"}:${c.model}`,
+              )
+              .join(",")}`
+          : "";
+      console.log(`${m.from} → ${m.to}${pin}${chain}`);
     }
   });
 
 mapCmd
   .command("set")
-  .description("Set model map from → to")
+  .description("Set model map from → to (optional multi-channel candidates)")
   .argument("<from>", "inbound model id (what Grok sends)")
-  .argument("<to>", "upstream model id")
-  .option("--provider <id>", "pin to a provider")
-  .action(async (from: string, to: string, opts: { provider?: string }) => {
+  .argument("<to>", "upstream model id (primary)")
+  .option("--provider <id>", "pin primary provider")
+  .option(
+    "--candidates <list>",
+    "ordered candidates as provider:model,provider:model (empty provider = active)",
+  )
+  .action(
+    async (
+      from: string,
+      to: string,
+      opts: { provider?: string; candidates?: string },
+    ) => {
     const store = getConfigStore();
+    const candidates = (opts.candidates ?? "")
+      .split(",")
+      .map((s) => s.trim())
+      .filter(Boolean)
+      .map((part) => {
+        const idx = part.indexOf(":");
+        if (idx === -1) {
+          return {
+            providerId: opts.provider ?? "",
+            model: part,
+            enabled: true,
+          };
+        }
+        return {
+          providerId: part.slice(0, idx).trim(),
+          model: part.slice(idx + 1).trim(),
+          enabled: true,
+        };
+      });
     const entry = {
       from,
       to,
       providerId: opts.provider ?? null,
+      candidates,
     };
     const live = await isServerRunning();
     if (live) {
@@ -338,7 +384,8 @@ mapCmd
       return cfg;
     });
     console.log(`Map ${from} → ${to}`);
-  });
+  },
+  );
 
 mapCmd
   .command("remove")
@@ -728,4 +775,107 @@ program
     }
   });
 
-await program.parseAsync(process.argv);
+program
+  .command("config")
+  .description("Config path / reset / restore")
+  .action(() => {
+    const store = getConfigStore();
+    console.log(`Data home : ${store.gbgHome}`);
+    console.log(`Config    : ${store.path}`);
+    const backups = store.listBackups();
+    if (!backups.length) console.log("Backups   : (none)");
+    else {
+      console.log("Backups   :");
+      for (const b of backups.slice(0, 10)) {
+        console.log(`  ${b.name}`);
+      }
+    }
+  });
+
+program
+  .command("reset-config")
+  .description("Restore default config (backs up current first)")
+  .option("--yes", "skip confirmation", false)
+  .option("--from-backup [name]", "restore from a backup instead of defaults")
+  .action(async (opts: { yes?: boolean; fromBackup?: string | true }) => {
+    const live = await isServerRunning();
+    const mode =
+      opts.fromBackup === undefined ? "defaults" : "backup";
+    const backup =
+      typeof opts.fromBackup === "string" ? opts.fromBackup : undefined;
+
+    if (!opts.yes) {
+      const label =
+        mode === "defaults"
+          ? "Reset config to factory defaults?"
+          : `Restore config from backup${backup ? ` (${backup})` : " (latest)"}?`;
+      process.stdout.write(`${label} [y/N] `);
+      const answer = await new Promise<string>((resolve) => {
+        process.stdin.setEncoding("utf8");
+        process.stdin.once("data", (d) => resolve(String(d).trim()));
+      });
+      if (answer.toLowerCase() !== "y" && answer.toLowerCase() !== "yes") {
+        console.log("Cancelled.");
+        return;
+      }
+    }
+
+    if (live) {
+      const r = await tryLocalApi<{
+        ok?: boolean;
+        message?: string;
+        backupPath?: string | null;
+        restoredFrom?: string | null;
+        error?: string;
+      }>("/api/config/reset", {
+        method: "POST",
+        body: JSON.stringify({ mode, backup }),
+      });
+      if (!r.ok) {
+        console.error(r.error || "reset failed");
+        process.exitCode = 1;
+        return;
+      }
+      console.log(r.data.message || "ok");
+      if (r.data.backupPath) console.log(`Previous backup: ${r.data.backupPath}`);
+      if (r.data.restoredFrom) console.log(`Restored from: ${r.data.restoredFrom}`);
+      return;
+    }
+
+    const store = getConfigStore();
+    try {
+      const result =
+        mode === "backup"
+          ? store.restoreFromBackup(backup)
+          : store.resetToDefaults();
+      console.log(
+        result.mode === "defaults"
+          ? "Restored factory defaults."
+          : `Restored from ${result.restoredFrom}`,
+      );
+      if (result.backupPath) console.log(`Previous backup: ${result.backupPath}`);
+    } catch (err) {
+      console.error(err instanceof Error ? err.message : err);
+      process.exitCode = 1;
+    }
+  });
+
+program
+  .command("failover")
+  .description("Show failover config and provider cooldown health")
+  .action(async () => {
+    const live = await tryLocalApi<{
+      failover?: Record<string, unknown>;
+      providerHealth?: Array<Record<string, unknown>>;
+    }>("/api/failover");
+    if (live.ok) {
+      console.log("Failover:", JSON.stringify(live.data.failover ?? {}, null, 2));
+      console.log("Health:", JSON.stringify(live.data.providerHealth ?? [], null, 2));
+      return;
+    }
+    const cfg = getConfigStore().get();
+    console.log("Failover:", JSON.stringify(cfg.server.failover ?? {}, null, 2));
+    console.log("(start server for live provider health)");
+  });
+
+void program.parseAsync(process.argv);

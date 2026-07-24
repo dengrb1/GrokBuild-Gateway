@@ -6,10 +6,19 @@ import { globalRequestLog } from "../lib/request-log.js";
 import { joinUrl } from "../lib/url.js";
 import { upstreamFetch } from "../lib/http-client.js";
 import {
+  isFailoverableStatus,
+  isProviderCoolingDown,
+  markProviderFailure,
+  markProviderSuccess,
+} from "../lib/provider-health.js";
+import {
   isProviderProxyShieldOn,
   type ApiBackend,
+  type AttemptLog,
+  type FailoverConfig,
   type Provider,
   type RequestLogEntry,
+  type RouteCandidate,
 } from "./types.js";
 import {
   convertRequest,
@@ -65,17 +74,17 @@ function buildUpstreamHeaders(
   const key = resolveSecret(provider.apiKey);
   const backend = provider.apiBackend ?? "responses";
 
-  // Anthropic Messages API prefers x-api-key (+ version header)
   if (backend === "messages") {
     if (key) {
       headers.set("x-api-key", key);
-      // some OpenAI-compatible Anthropic proxies also accept Bearer
       headers.set("authorization", `Bearer ${key}`);
     }
-    if (!headerHas(headers, "anthropic-version") && !provider.extraHeaders?.["anthropic-version"]) {
+    if (
+      !headerHas(headers, "anthropic-version") &&
+      !provider.extraHeaders?.["anthropic-version"]
+    ) {
       headers.set("anthropic-version", "2023-06-01");
     }
-    // enable tools / computer use betas when client sent them
     const beta = inbound.get("anthropic-beta");
     if (beta) headers.set("anthropic-beta", beta);
   } else if (key) {
@@ -86,7 +95,6 @@ function buildUpstreamHeaders(
     headers.set(k, v);
   }
 
-  // Ensure Anthropic stream clients get SSE
   if (
     (backend === "messages" || clientProtocol === "messages") &&
     !headers.get("accept")
@@ -174,7 +182,7 @@ function wrapUpstreamStream(
     try {
       controller.close();
     } catch {
-      // The client may cancel the stream while the upstream read is settling.
+      // ignore
     }
   };
 
@@ -195,7 +203,7 @@ function wrapUpstreamStream(
         try {
           if (streamController) closeController(streamController);
         } catch {
-          // The runtime may already have canceled the response body.
+          // ignore
         }
       };
       if (options.clientSignal) {
@@ -235,8 +243,6 @@ function wrapUpstreamStream(
         const message = timedOut
           ? `Upstream stream timed out after ${options.timeoutMs}ms`
           : `Upstream connection closed while reading the stream: ${streamErrorMessage(err)}`;
-        // The gateway is about to emit a protocol error event, so the client
-        // has a stream response even when upstream sent no body bytes.
         streamStarted = true;
         complete({
           status: timedOut ? 504 : 502,
@@ -287,6 +293,77 @@ function gatewayErrorSummary(
   return `${subject} (provider=${providerId ?? "unknown"}, protocol=${protocol ?? "unknown"}, proxy=${proxyMode ?? "unknown"}): ${message}`;
 }
 
+function prepareCandidateBody(
+  clientObj: JsonObject | null,
+  candidate: RouteCandidate,
+  clientProtocol: ApiBackend | null,
+  accept: string | undefined,
+): { bodyText?: string; upstreamProtocol: ApiBackend; stream: boolean; converted: boolean } {
+  const upstreamProtocol = candidate.provider.apiBackend ?? "responses";
+  if (!clientObj) {
+    return { upstreamProtocol, stream: false, converted: false };
+  }
+  let obj = { ...clientObj } as JsonObject;
+  if (candidate.modelOut !== null) {
+    obj.model = candidate.modelOut;
+  }
+  let converted = false;
+  if (clientProtocol && clientProtocol !== upstreamProtocol) {
+    obj = convertRequest(obj, clientProtocol, upstreamProtocol);
+    converted = true;
+  }
+  let stream = wantsStream(obj, accept);
+  if (stream && obj.stream !== true) {
+    obj.stream = true;
+  }
+  return {
+    bodyText: JSON.stringify(obj),
+    upstreamProtocol,
+    stream,
+    converted,
+  };
+}
+
+function copyPassHeaders(upstream: Response): Headers {
+  const respHeaders = new Headers();
+  const passHeaders = [
+    "content-type",
+    "cache-control",
+    "x-request-id",
+    "openai-processing-ms",
+    "openai-version",
+    "anthropic-ratelimit-requests-remaining",
+    "anthropic-ratelimit-tokens-remaining",
+    "request-id",
+  ];
+  for (const h of passHeaders) {
+    const v = upstream.headers.get(h);
+    if (v) respHeaders.set(h, v);
+  }
+  for (const h of [
+    "connection",
+    "content-encoding",
+    "content-length",
+    "keep-alive",
+    "transfer-encoding",
+  ]) {
+    respHeaders.delete(h);
+  }
+  return respHeaders;
+}
+
+function getFailoverConfig(server: {
+  failover?: Partial<FailoverConfig> | null;
+}): FailoverConfig {
+  return {
+    enabled: server.failover?.enabled !== false,
+    maxAttempts: server.failover?.maxAttempts ?? 3,
+    firstByteTimeoutMs: server.failover?.firstByteTimeoutMs ?? 30_000,
+    cooldownMs: server.failover?.cooldownMs ?? 60_000,
+    consecutiveFailures: server.failover?.consecutiveFailures ?? 2,
+  };
+}
+
 export function createProxyHandlers(store: ConfigStore) {
   async function handleModels(c: Context): Promise<Response> {
     const cfg = store.get();
@@ -327,6 +404,13 @@ export function createProxyHandlers(store: ConfigStore) {
     const path = c.req.path;
     const method = c.req.method.toUpperCase();
     const clientProtocol = detectClientProtocol(path);
+    const failover = getFailoverConfig(cfg.server);
+    const requestTimeoutMs = cfg.server.requestTimeoutMs ?? 600_000;
+    const firstByteBudget = Math.min(
+      requestTimeoutMs,
+      failover.firstByteTimeoutMs,
+    );
+
     const logBase: Omit<RequestLogEntry, "status" | "latencyMs"> = {
       id: newLogId(),
       ts: Date.now(),
@@ -337,12 +421,10 @@ export function createProxyHandlers(store: ConfigStore) {
       providerId: null,
     };
 
-    let bodyText: string | undefined;
     let modelIn: string | null = null;
     let modelOut: string | null = null;
-    let provider: Provider;
+    let provider: Provider | null = null;
     let upstreamProtocol: ApiBackend = "responses";
-    let convertedRequest = false;
     let stream = false;
     let requestBodyMs: number | undefined;
     let upstreamHeadersMs: number | undefined;
@@ -350,6 +432,10 @@ export function createProxyHandlers(store: ConfigStore) {
     let durationMs: number | undefined;
     let proxyMode: "direct" | "env" | undefined;
     let logWritten = false;
+    let attempts: AttemptLog[] = [];
+    let clientObj: JsonObject | null = null;
+    let rawBodyText: string | undefined;
+    let candidates: RouteCandidate[] = [];
 
     const recordLog = (
       status: number,
@@ -365,6 +451,7 @@ export function createProxyHandlers(store: ConfigStore) {
         ...extra,
         modelIn,
         modelOut,
+        providerId: provider?.id ?? logBase.providerId,
         status,
         latencyMs: first,
         requestBodyMs,
@@ -374,6 +461,7 @@ export function createProxyHandlers(store: ConfigStore) {
         clientProtocol,
         upstreamProtocol,
         proxyMode,
+        attempts: attempts.length ? attempts : extra.attempts,
         error: error ?? extra.error,
       });
     };
@@ -383,37 +471,27 @@ export function createProxyHandlers(store: ConfigStore) {
       if (method === "POST" || method === "PUT" || method === "PATCH") {
         const json = await readJsonBody(c);
         if (json && typeof json === "object" && json !== null) {
-          let obj = asObject(json) as JsonObject;
-          modelIn = typeof obj.model === "string" ? obj.model : null;
+          clientObj = asObject(json) as JsonObject;
+          modelIn = typeof clientObj.model === "string" ? clientObj.model : null;
           const route = resolveRoute(cfg, modelIn);
+          candidates = route.candidates;
           provider = route.provider;
           modelOut = route.modelOut;
           upstreamProtocol = provider.apiBackend ?? "responses";
-
-          if (modelOut !== null && "model" in obj) {
-            obj.model = modelOut;
-          }
-
-          // Protocol translation for inference endpoints
-          if (clientProtocol && clientProtocol !== upstreamProtocol) {
-            obj = convertRequest(obj, clientProtocol, upstreamProtocol);
-            convertedRequest = true;
-          }
-
-          stream = wantsStream(obj, c.req.header("accept"));
-          // Ensure stream flag consistent when client asked for SSE via Accept only
-          if (stream && obj.stream !== true) {
-            obj.stream = true;
-          }
-
-          bodyText = JSON.stringify(obj);
+          stream = wantsStream(clientObj, c.req.header("accept"));
         } else {
-          provider = resolveRoute(cfg, null).provider;
+          rawBodyText = await c.req.text();
+          const route = resolveRoute(cfg, null);
+          candidates = route.candidates;
+          provider = route.provider;
+          modelOut = route.modelOut;
           upstreamProtocol = provider.apiBackend ?? "responses";
-          bodyText = await c.req.text();
         }
       } else {
-        provider = resolveRoute(cfg, null).provider;
+        const route = resolveRoute(cfg, null);
+        candidates = route.candidates;
+        provider = route.provider;
+        modelOut = route.modelOut;
         upstreamProtocol = provider.apiBackend ?? "responses";
       }
       requestBodyMs = Date.now() - bodyStarted;
@@ -433,262 +511,412 @@ export function createProxyHandlers(store: ConfigStore) {
       );
     }
 
+    if (!provider || !candidates.length) {
+      recordLog(400, "No route candidates", { errorStage: "request" });
+      return c.json(
+        {
+          error: {
+            message: "No route candidates",
+            type: "invalid_request_error",
+            code: "route_error",
+          },
+        },
+        400,
+      );
+    }
+
     logBase.modelIn = modelIn;
     logBase.modelOut = modelOut;
     logBase.providerId = provider.id;
 
-    // Rewrite path to match upstream protocol when translating
-    let upstreamPath = path;
-    if (clientProtocol && isInferencePath(path)) {
-      if (clientProtocol !== upstreamProtocol || convertedRequest) {
-        upstreamPath = protocolPath(upstreamProtocol);
-      }
-    }
+    const maxAttempts = failover.enabled
+      ? Math.min(failover.maxAttempts, candidates.length)
+      : 1;
 
-    const upstreamUrl = joinUrl(provider.baseUrl, upstreamPath);
-    const url = new URL(upstreamUrl);
-    const inboundUrl = new URL(c.req.url);
-    // Don't forward client-only query params that break upstream
-    url.search = inboundUrl.search;
-
-    const headers = buildUpstreamHeaders(
-      provider,
-      c.req.raw.headers,
-      clientProtocol,
-    );
-    const timeoutMs = cfg.server.requestTimeoutMs ?? 600_000;
-    const controller = new AbortController();
-    let timedOut = false;
-    let clientCancelled = false;
-    let streamOwnsLifecycle = false;
-    let stage = "upstream_headers";
     const clientSignal = c.req.raw.signal;
+    let clientCancelled = false;
     const onClientAbort = () => {
       clientCancelled = true;
-      controller.abort("client_cancelled");
     };
     if (clientSignal.aborted) onClientAbort();
     else clientSignal.addEventListener("abort", onClientAbort, { once: true });
-    const timer = setTimeout(() => {
-      timedOut = true;
-      controller.abort("upstream_timeout");
-    }, timeoutMs);
+
+    let lastErrorMessage = "All upstream candidates failed";
+    let lastStatus = 502;
+    let lastProxyMode: "direct" | "env" | undefined;
+    let lastUpstreamProtocol: ApiBackend = upstreamProtocol;
 
     try {
-      const forceDirect = isProviderProxyShieldOn(cfg.server, provider);
-      proxyMode = forceDirect ? "direct" : "env";
-      const upstreamStarted = Date.now();
-      const upstream = await upstreamFetch(url, {
-        method,
-        headers,
-        body:
-          method === "GET" || method === "HEAD"
-            ? undefined
-            : (bodyText ?? undefined),
-        signal: controller.signal,
-        forceDirect,
-      });
-      upstreamHeadersMs = Date.now() - upstreamStarted;
-      firstByteMs = Date.now() - started;
-
-      const respHeaders = new Headers();
-      const passHeaders = [
-        "content-type",
-        "cache-control",
-        "x-request-id",
-        "openai-processing-ms",
-        "openai-version",
-        "anthropic-ratelimit-requests-remaining",
-        "anthropic-ratelimit-tokens-remaining",
-        "request-id",
-      ];
-      for (const h of passHeaders) {
-        const v = upstream.headers.get(h);
-        if (v) respHeaders.set(h, v);
-      }
-      for (const h of [
-        "connection",
-        "content-encoding",
-        "content-length",
-        "keep-alive",
-        "transfer-encoding",
-      ]) {
-        respHeaders.delete(h);
-      }
-
-      const ct = upstream.headers.get("content-type") ?? "";
-      const isStream =
-        stream ||
-        ct.includes("text/event-stream") ||
-        ct.includes("application/x-ndjson");
-
-      const needsResponseConvert =
-        Boolean(clientProtocol) &&
-        clientProtocol !== upstreamProtocol &&
-        upstream.ok;
-
-      if (isStream && upstream.body) {
-        let body: ReadableStream<Uint8Array> = upstream.body;
-        if (needsResponseConvert && clientProtocol) {
-          body = transformSseStream(
-            upstream.body,
-            upstreamProtocol,
-            clientProtocol,
-          );
-          respHeaders.set("content-type", "text/event-stream; charset=utf-8");
-          respHeaders.set("cache-control", "no-cache");
+      for (let i = 0; i < maxAttempts; i++) {
+        if (clientCancelled) {
+          lastStatus = 499;
+          lastErrorMessage = "client disconnected";
+          break;
         }
-        streamOwnsLifecycle = true;
-        body = wrapUpstreamStream(body, {
-          signal: controller.signal,
-          clientSignal,
-          timeoutMs,
-          timer,
-          timedOut: () => timedOut,
-          clientCancelled: () => clientCancelled,
-          protocol: clientProtocol ?? upstreamProtocol,
-          status: upstream.status,
-          initialError:
-            upstream.status >= 400 ? `upstream ${upstream.status}` : undefined,
-          onCleanup: () => clientSignal.removeEventListener("abort", onClientAbort),
-          onComplete: (result) => {
-            durationMs = Date.now() - started;
-            recordLog(result.status, result.error, {
-              stream: true,
-              streamStarted: result.streamStarted,
-              errorStage: result.errorStage,
-            });
-          },
-        });
-        return new Response(body, {
-          status: upstream.status,
-          headers: respHeaders,
-        });
-      }
 
-      stage = "upstream_body";
-      const buf = await upstream.arrayBuffer();
-      durationMs = Date.now() - started;
-      let outBuf: ArrayBuffer | Uint8Array = buf;
+        const candidate = candidates[i]!;
+        provider = candidate.provider;
+        modelOut = candidate.modelOut;
+        logBase.providerId = provider.id;
+        logBase.modelOut = modelOut;
 
-      if (
-        needsResponseConvert &&
-        clientProtocol &&
-        ct.includes("json") &&
-        buf.byteLength > 0
-      ) {
-        try {
-          const text = new TextDecoder().decode(buf);
-          const parsed: unknown = JSON.parse(text);
-          if (isObject(parsed)) {
-            const converted = convertResponse(
-              parsed,
-              upstreamProtocol,
-              clientProtocol,
-            );
-            const encoded = new TextEncoder().encode(
-              JSON.stringify(converted),
-            );
-            outBuf = encoded;
-            respHeaders.set("content-type", "application/json");
-            respHeaders.delete("content-length");
+        if (i > 0 && isProviderCoolingDown(provider.id)) {
+          attempts.push({
+            providerId: provider.id,
+            modelOut,
+            skipped: true,
+            reason: "cooldown",
+          });
+          continue;
+        }
+
+        const prepared = prepareCandidateBody(
+          clientObj,
+          candidate,
+          clientProtocol,
+          c.req.header("accept"),
+        );
+        upstreamProtocol = prepared.upstreamProtocol;
+        lastUpstreamProtocol = upstreamProtocol;
+        stream = prepared.stream || stream;
+        const bodyText = clientObj
+          ? prepared.bodyText
+          : rawBodyText;
+
+        let upstreamPath = path;
+        if (clientProtocol && isInferencePath(path)) {
+          if (clientProtocol !== upstreamProtocol || prepared.converted) {
+            upstreamPath = protocolPath(upstreamProtocol);
           }
-        } catch {
-          // leave original body on parse failure
         }
-      }
 
-      // Error responses: try to keep JSON shape friendly
-      if (
-        !upstream.ok &&
-        clientProtocol &&
-        clientProtocol !== upstreamProtocol &&
-        ct.includes("json")
-      ) {
+        const upstreamUrl = joinUrl(provider.baseUrl, upstreamPath);
+        const url = new URL(upstreamUrl);
+        const inboundUrl = new URL(c.req.url);
+        url.search = inboundUrl.search;
+
+        const headers = buildUpstreamHeaders(
+          provider,
+          c.req.raw.headers,
+          clientProtocol,
+        );
+        const forceDirect = isProviderProxyShieldOn(cfg.server, provider);
+        proxyMode = forceDirect ? "direct" : "env";
+        lastProxyMode = proxyMode;
+
+        const attemptTimeoutMs =
+          i < maxAttempts - 1 ? firstByteBudget : requestTimeoutMs;
+        const controller = new AbortController();
+        let timedOut = false;
+        let streamOwnsLifecycle = false;
+        let stage = "upstream_headers";
+        const onAttemptClientAbort = () => {
+          clientCancelled = true;
+          controller.abort("client_cancelled");
+        };
+        if (clientSignal.aborted) onAttemptClientAbort();
+        else {
+          clientSignal.addEventListener("abort", onAttemptClientAbort, {
+            once: true,
+          });
+        }
+        const timer = setTimeout(() => {
+          timedOut = true;
+          controller.abort("upstream_timeout");
+        }, attemptTimeoutMs);
+
+        const attemptStarted = Date.now();
         try {
-          const text = new TextDecoder().decode(buf);
-          const parsed: unknown = JSON.parse(text);
-          if (isObject(parsed)) {
-            // Normalize anthropic error → openai-ish
-            if (parsed.error && isObject(parsed.error)) {
-              // already structured
-            } else if (parsed.type === "error") {
-              const normalized = {
-                error: {
-                  message: asObject(parsed.error).message ?? parsed.message ?? text,
-                  type: asObject(parsed.error).type ?? "api_error",
-                  code: "upstream_error",
-                  provider: provider.id,
-                },
-              };
-              outBuf = new TextEncoder().encode(JSON.stringify(normalized));
-              respHeaders.set("content-type", "application/json");
+          const upstream = await upstreamFetch(url, {
+            method,
+            headers,
+            body:
+              method === "GET" || method === "HEAD"
+                ? undefined
+                : (bodyText ?? undefined),
+            signal: controller.signal,
+            forceDirect,
+          });
+          upstreamHeadersMs = Date.now() - attemptStarted;
+          firstByteMs = Date.now() - started;
+
+          const canFailover =
+            failover.enabled &&
+            i < maxAttempts - 1 &&
+            isFailoverableStatus(upstream.status);
+
+          if (canFailover) {
+            // Drain error body so the socket can close cleanly, then try next.
+            try {
+              await upstream.arrayBuffer();
+            } catch {
+              // ignore
+            }
+            clearTimeout(timer);
+            clientSignal.removeEventListener("abort", onAttemptClientAbort);
+            const errMsg = `upstream ${upstream.status}`;
+            attempts.push({
+              providerId: provider.id,
+              modelOut,
+              status: upstream.status,
+              error: errMsg,
+              latencyMs: Date.now() - attemptStarted,
+            });
+            markProviderFailure(provider.id, errMsg, {
+              consecutiveFailures: failover.consecutiveFailures,
+              cooldownMs: failover.cooldownMs,
+            });
+            lastStatus = upstream.status;
+            lastErrorMessage = errMsg;
+            continue;
+          }
+
+          // Success path (or non-failoverable HTTP error) — lock this candidate.
+          markProviderSuccess(provider.id);
+          attempts.push({
+            providerId: provider.id,
+            modelOut,
+            status: upstream.status,
+            latencyMs: Date.now() - attemptStarted,
+            error:
+              upstream.status >= 400 ? `upstream ${upstream.status}` : undefined,
+          });
+
+          const respHeaders = copyPassHeaders(upstream);
+          const ct = upstream.headers.get("content-type") ?? "";
+          const isStream =
+            stream ||
+            ct.includes("text/event-stream") ||
+            ct.includes("application/x-ndjson");
+
+          const needsResponseConvert =
+            Boolean(clientProtocol) &&
+            clientProtocol !== upstreamProtocol &&
+            upstream.ok;
+
+          if (isStream && upstream.body) {
+            let body: ReadableStream<Uint8Array> = upstream.body;
+            if (needsResponseConvert && clientProtocol) {
+              body = transformSseStream(
+                upstream.body,
+                upstreamProtocol,
+                clientProtocol,
+              );
+              respHeaders.set(
+                "content-type",
+                "text/event-stream; charset=utf-8",
+              );
+              respHeaders.set("cache-control", "no-cache");
+            }
+            streamOwnsLifecycle = true;
+            // Extend timeout for the full stream after first-byte decision.
+            clearTimeout(timer);
+            const streamTimer = setTimeout(() => {
+              timedOut = true;
+              controller.abort("upstream_timeout");
+            }, requestTimeoutMs);
+            body = wrapUpstreamStream(body, {
+              signal: controller.signal,
+              clientSignal,
+              timeoutMs: requestTimeoutMs,
+              timer: streamTimer,
+              timedOut: () => timedOut,
+              clientCancelled: () => clientCancelled,
+              protocol: clientProtocol ?? upstreamProtocol,
+              status: upstream.status,
+              initialError:
+                upstream.status >= 400
+                  ? `upstream ${upstream.status}`
+                  : undefined,
+              onCleanup: () =>
+                clientSignal.removeEventListener("abort", onAttemptClientAbort),
+              onComplete: (result) => {
+                durationMs = Date.now() - started;
+                recordLog(result.status, result.error, {
+                  stream: true,
+                  streamStarted: result.streamStarted,
+                  errorStage: result.errorStage,
+                  attempts,
+                });
+              },
+            });
+            return new Response(body, {
+              status: upstream.status,
+              headers: respHeaders,
+            });
+          }
+
+          stage = "upstream_body";
+          const buf = await upstream.arrayBuffer();
+          durationMs = Date.now() - started;
+          let outBuf: ArrayBuffer | Uint8Array = buf;
+
+          if (
+            needsResponseConvert &&
+            clientProtocol &&
+            ct.includes("json") &&
+            buf.byteLength > 0
+          ) {
+            try {
+              const text = new TextDecoder().decode(buf);
+              const parsed: unknown = JSON.parse(text);
+              if (isObject(parsed)) {
+                const converted = convertResponse(
+                  parsed,
+                  upstreamProtocol,
+                  clientProtocol,
+                );
+                outBuf = new TextEncoder().encode(JSON.stringify(converted));
+                respHeaders.set("content-type", "application/json");
+                respHeaders.delete("content-length");
+              }
+            } catch {
+              // leave original body
             }
           }
-        } catch {
-          // ignore
+
+          if (
+            !upstream.ok &&
+            clientProtocol &&
+            clientProtocol !== upstreamProtocol &&
+            ct.includes("json")
+          ) {
+            try {
+              const text = new TextDecoder().decode(buf);
+              const parsed: unknown = JSON.parse(text);
+              if (isObject(parsed)) {
+                if (parsed.type === "error") {
+                  const normalized = {
+                    error: {
+                      message:
+                        asObject(parsed.error).message ??
+                        parsed.message ??
+                        text,
+                      type: asObject(parsed.error).type ?? "api_error",
+                      code: "upstream_error",
+                      provider: provider.id,
+                    },
+                  };
+                  outBuf = new TextEncoder().encode(
+                    JSON.stringify(normalized),
+                  );
+                  respHeaders.set("content-type", "application/json");
+                }
+              }
+            } catch {
+              // ignore
+            }
+          }
+
+          clearTimeout(timer);
+          clientSignal.removeEventListener("abort", onAttemptClientAbort);
+          recordLog(
+            upstream.status,
+            upstream.status >= 400 ? `upstream ${upstream.status}` : undefined,
+            {
+              stream: false,
+              errorStage:
+                upstream.status >= 400 ? "upstream_http" : undefined,
+              attempts,
+            },
+          );
+          return new Response(outBuf, {
+            status: upstream.status,
+            headers: respHeaders,
+          });
+        } catch (err) {
+          clearTimeout(timer);
+          clientSignal.removeEventListener("abort", onAttemptClientAbort);
+
+          if (clientCancelled) {
+            lastStatus = 499;
+            lastErrorMessage = "client disconnected";
+            attempts.push({
+              providerId: provider.id,
+              modelOut,
+              status: 499,
+              error: lastErrorMessage,
+              latencyMs: Date.now() - attemptStarted,
+            });
+            break;
+          }
+
+          const aborted =
+            timedOut || (err instanceof Error && err.name === "AbortError");
+          const rawMessage = timedOut
+            ? `timeout after ${attemptTimeoutMs}ms`
+            : streamErrorMessage(err);
+          const errMsg = gatewayErrorSummary(
+            stage,
+            provider.id,
+            clientProtocol ?? upstreamProtocol,
+            proxyMode,
+            rawMessage,
+          );
+          attempts.push({
+            providerId: provider.id,
+            modelOut,
+            status: aborted ? 504 : 502,
+            error: errMsg,
+            latencyMs: Date.now() - attemptStarted,
+          });
+          markProviderFailure(provider.id, errMsg, {
+            consecutiveFailures: failover.consecutiveFailures,
+            cooldownMs: failover.cooldownMs,
+          });
+          lastStatus = aborted ? 504 : 502;
+          lastErrorMessage = errMsg;
+
+          const canFailover =
+            failover.enabled && i < maxAttempts - 1 && !clientCancelled;
+          if (canFailover) continue;
+          break;
+        } finally {
+          // stream path owns its timers via wrapUpstreamStream
+          void streamOwnsLifecycle;
         }
       }
 
-      recordLog(
-        upstream.status,
-        upstream.status >= 400 ? `upstream ${upstream.status}` : undefined,
-        { stream: false, errorStage: upstream.status >= 400 ? "upstream_http" : undefined },
-      );
-      return new Response(outBuf, {
-        status: upstream.status,
-        headers: respHeaders,
-      });
-    } catch (err) {
-      const aborted = timedOut || (err instanceof Error && err.name === "AbortError");
-      const rawMessage = clientCancelled
-        ? "client disconnected"
-        : timedOut
-          ? `timeout after ${timeoutMs}ms`
-          : streamErrorMessage(err);
-      const errorStage = clientCancelled ? "client" : stage;
-      const message = gatewayErrorSummary(
-        errorStage,
-        provider.id,
-        clientProtocol ?? upstreamProtocol,
-        proxyMode,
-        rawMessage,
-      );
-      const status = clientCancelled ? 499 : aborted ? 504 : 502;
       durationMs = Date.now() - started;
-      recordLog(status, message, {
-        errorStage,
+      proxyMode = lastProxyMode;
+      upstreamProtocol = lastUpstreamProtocol;
+      const summary =
+        attempts.length > 1
+          ? `${lastErrorMessage} (after ${attempts.length} attempts)`
+          : lastErrorMessage;
+      recordLog(lastStatus, summary, {
+        errorStage: clientCancelled ? "client" : "upstream_headers",
         streamStarted: false,
+        attempts,
       });
       const errorBody = {
         error: {
-          message,
+          message: summary,
           type: "api_error",
-          code: clientCancelled
-            ? "client_cancelled"
-            : aborted
-              ? "upstream_timeout"
-              : "upstream_error",
-          provider: provider.id,
+          code:
+            lastStatus === 499
+              ? "client_cancelled"
+              : lastStatus === 504
+                ? "upstream_timeout"
+                : "upstream_error",
+          provider: provider?.id,
           clientProtocol,
           upstreamProtocol,
           proxyMode,
-          errorStage,
+          errorStage: clientCancelled ? "client" : "upstream_headers",
           streamStarted: false as const,
+          attempts,
         },
       };
-      if (status === 499) {
+      if (lastStatus === 499) {
         return new Response(JSON.stringify(errorBody), {
           status: 499,
           headers: { "content-type": "application/json" },
         });
       }
-      return c.json(errorBody, status);
+      return c.json(errorBody, lastStatus as 502 | 504);
     } finally {
-      if (!streamOwnsLifecycle) {
-        clearTimeout(timer);
-        clientSignal.removeEventListener("abort", onClientAbort);
-      }
+      clientSignal.removeEventListener("abort", onClientAbort);
     }
   }
 

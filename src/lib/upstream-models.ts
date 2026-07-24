@@ -1,3 +1,4 @@
+import { normalizeModelMap, type ModelMap } from "../server/types.js";
 import type { Provider, ServerConfig, VirtualModel } from "../server/types.js";
 import { isProviderProxyShieldOn } from "../server/types.js";
 import { upstreamFetch } from "./http-client.js";
@@ -191,43 +192,46 @@ export function mergeVirtualModels(
 export function buildIdentityMaps(
   models: UpstreamModel[],
   options?: { providerId?: string | null; onlyIds?: string[] },
-): Array<{ from: string; to: string; providerId: string | null }> {
+): ModelMap[] {
   const allow = options?.onlyIds?.length
     ? new Set(options.onlyIds)
     : null;
   return models
     .filter((m) => !allow || allow.has(m.id))
-    .map((m) => ({
-      from: m.id,
-      to: m.id,
-      providerId: options?.providerId ?? null,
-    }));
+    .map((m) =>
+      normalizeModelMap({
+        from: m.id,
+        to: m.id,
+        providerId: options?.providerId ?? null,
+      }),
+    );
 }
 
 export function mergeModelMaps(
-  existing: Array<{ from: string; to: string; providerId?: string | null }>,
-  incoming: Array<{ from: string; to: string; providerId?: string | null }>,
+  existing: Array<{
+    from: string;
+    to: string;
+    providerId?: string | null;
+    candidates?: ModelMap["candidates"];
+  }>,
+  incoming: Array<{
+    from: string;
+    to: string;
+    providerId?: string | null;
+    candidates?: ModelMap["candidates"];
+  }>,
   mode: "merge" | "replace",
-): Array<{ from: string; to: string; providerId: string | null }> {
+): ModelMap[] {
   if (mode === "replace") {
-    return incoming.map((m) => ({
-      from: m.from,
-      to: m.to,
-      providerId: m.providerId ?? null,
-    }));
+    return incoming
+      .map((m) => normalizeModelMap(m))
+      .sort((a, b) => a.from.localeCompare(b.from));
   }
   const map = new Map(
-    existing.map((m) => [
-      m.from,
-      { from: m.from, to: m.to, providerId: m.providerId ?? null },
-    ]),
+    existing.map((m) => [m.from, normalizeModelMap(m)]),
   );
   for (const m of incoming) {
-    map.set(m.from, {
-      from: m.from,
-      to: m.to,
-      providerId: m.providerId ?? null,
-    });
+    map.set(m.from, normalizeModelMap(m));
   }
   return [...map.values()].sort((a, b) => a.from.localeCompare(b.from));
 }

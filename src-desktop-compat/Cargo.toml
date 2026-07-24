@@ -1,6 +1,6 @@
 [package]
 name = "gbg-desktop-compat"
-version = "0.3.0"
+version = "1.1.0"
 description = "GrokBuild Gateway tray shell without WebView2 (Win7+ / no Edge runtime)"
 authors = ["GrokBuild-Gateway"]
 edition = "2021"

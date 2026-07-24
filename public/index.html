@@ -93,6 +93,8 @@
               <div class="row" style="margin-top: 0.9rem">
                 <button id="btn-apply-grok" class="btn primary">一键写入 Grok 配置</button>
                 <button id="btn-copy-bootstrap" class="btn">复制片段</button>
+                <button id="btn-reset-config" class="btn danger" title="备份当前配置后恢复默认">还原默认配置</button>
+                <button id="btn-restore-backup" class="btn" title="从最近一次备份还原">从备份还原</button>
               </div>
             </div>
 
@@ -165,7 +167,7 @@
             <div class="card-header">
               <div>
                 <h2>模型映射</h2>
-                <p class="hint">Grok 模型名 → 上游真实模型名，可固定供应商</p>
+                <p class="hint">Grok 模型名 → 上游真实模型名；可配置多渠道候选链，故障时按顺序首字节前切换</p>
               </div>
               <div class="toolbar">
                 <select id="import-provider-maps" class="select-inline"></select>
@@ -179,7 +181,7 @@
                   <tr>
                     <th>From</th>
                     <th>To</th>
-                    <th>Provider</th>
+                    <th>Provider / 候选链</th>
                     <th style="width: 140px">操作</th>
                   </tr>
                 </thead>
@@ -187,11 +189,17 @@
               </table>
             </div>
 
-            <form id="map-form" class="form inline">
-              <input name="from" required placeholder="from（Grok 发出）" />
-              <input name="to" required placeholder="to（上游 id）" list="upstream-model-list" />
-              <input name="providerId" placeholder="provider（可选）" />
-              <button type="submit" class="btn primary">保存映射</button>
+            <form id="map-form" class="form">
+              <div class="form inline">
+                <input name="from" required placeholder="from（Grok 发出）" />
+                <input name="to" required placeholder="to（上游 id / 主候选）" list="upstream-model-list" />
+                <input name="providerId" placeholder="主 provider（可选）" />
+              </div>
+              <label class="hint" for="map-candidates">候选链（每行 provider:model，空 provider 表示 active；顺序=优先级）</label>
+              <textarea id="map-candidates" name="candidates" rows="3" placeholder="okinto:grok-4.5&#10;ccx:grok-4.5"></textarea>
+              <div class="row" style="margin-top:8px">
+                <button type="submit" class="btn primary">保存映射</button>
+              </div>
             </form>
             <div id="model-quick-fill" class="model-quick-fill hidden"></div>
             <datalist id="upstream-model-list"></datalist>

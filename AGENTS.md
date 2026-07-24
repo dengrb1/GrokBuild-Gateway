@@ -8,6 +8,8 @@
 - Anthropic 供应商继续使用 `messages`，不要改成 `responses`。
 - 旧配置中已经显式保存的 `apiBackend` 不自动迁移，避免覆盖用户配置。
 - 模型映射里的目标模型 ID 快捷填入只来自上游 `/models` 拉取结果，不维护硬编码常用模型列表。
+- 模型映射可选 `candidates` 多渠道候选链；故障转移仅在首字节前对 429/5xx/超时/网络错误生效。
+- 运行时配置默认写在运行目录 `data/`（`config.json`、`backups/`），不要再默认写用户主目录 `~/.gbg`。
 - Chat tools 转 OpenAI Responses 时，`function_call.call_id` 必须保留原始 Chat tool call id，`function_call.id` 使用 `fc_` 前缀的 Responses item id，`function_call_output.call_id` 与原始 id 对齐。
 - 转换工具定义时保留 OpenAI 兼容字段，例如 `strict`。
 

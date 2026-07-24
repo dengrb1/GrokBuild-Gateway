@@ -25,12 +25,87 @@ export const ProviderSchema = z.object({
 });
 export type Provider = z.infer<typeof ProviderSchema>;
 
-export const ModelMapSchema = z.object({
-  from: z.string().min(1),
-  to: z.string().min(1),
-  providerId: z.string().nullable().optional().default(null),
+export const ChannelCandidateSchema = z.object({
+  /** Empty string means "use active provider at request time". */
+  providerId: z.string().default(""),
+  model: z.string().min(1),
+  enabled: z.boolean().default(true),
 });
+export type ChannelCandidate = z.infer<typeof ChannelCandidateSchema>;
+
+export const ModelMapSchema = z
+  .object({
+    from: z.string().min(1),
+    to: z.string().min(1),
+    providerId: z.string().nullable().optional().default(null),
+    /** Ordered multi-channel candidates. Array order = priority. */
+    candidates: z.array(ChannelCandidateSchema).optional().default([]),
+  })
+  .transform((m) => normalizeModelMap(m));
 export type ModelMap = z.infer<typeof ModelMapSchema>;
+
+export function normalizeModelMap(input: {
+  from: string;
+  to: string;
+  providerId?: string | null;
+  candidates?: Array<{
+    providerId: string;
+    model: string;
+    enabled?: boolean;
+  }>;
+}): {
+  from: string;
+  to: string;
+  providerId: string | null;
+  candidates: ChannelCandidate[];
+} {
+  const from = input.from;
+  let candidates = (input.candidates ?? [])
+    .filter((c) => c.providerId?.trim() && c.model?.trim())
+    .map((c) => ({
+      providerId: c.providerId.trim(),
+      model: c.model.trim(),
+      enabled: c.enabled !== false,
+    }));
+
+  if (!candidates.length) {
+    candidates = [
+      {
+        providerId: (input.providerId ?? "").trim(),
+        model: input.to,
+        enabled: true,
+      },
+    ].filter((c) => c.model);
+    // providerId may be empty meaning "active provider" — keep as ""
+    if (!candidates.length) {
+      candidates = [
+        {
+          providerId: "",
+          model: input.to || from,
+          enabled: true,
+        },
+      ];
+    }
+  }
+
+  const primary =
+    candidates.find((c) => c.enabled) ?? candidates[0] ?? {
+      providerId: "",
+      model: input.to || from,
+      enabled: true,
+    };
+
+  return {
+    from,
+    to: primary.model || input.to || from,
+    providerId: primary.providerId ? primary.providerId : null,
+    candidates: candidates.map((c) => ({
+      providerId: c.providerId,
+      model: c.model,
+      enabled: c.enabled !== false,
+    })),
+  };
+}
 
 export const VirtualModelSchema = z.object({
   id: z.string().min(1),
@@ -42,6 +117,20 @@ export type VirtualModel = z.infer<typeof VirtualModelSchema>;
 
 export const ProxyModeSchema = z.enum(["direct", "env"]);
 export type ProxyMode = z.infer<typeof ProxyModeSchema>;
+
+export const FailoverConfigSchema = z.object({
+  /** Master switch; when false only the first available candidate is tried. */
+  enabled: z.boolean().default(true),
+  /** Max upstream attempts per request (including the first). */
+  maxAttempts: z.number().int().min(1).max(20).default(3),
+  /** Wait budget for deciding whether to switch channels. */
+  firstByteTimeoutMs: z.number().int().positive().default(30_000),
+  /** Temporary skip window after consecutive failures. */
+  cooldownMs: z.number().int().nonnegative().default(60_000),
+  /** Consecutive failures before cooldown. */
+  consecutiveFailures: z.number().int().min(1).default(2),
+});
+export type FailoverConfig = z.infer<typeof FailoverConfigSchema>;
 
 export const ServerConfigSchema = z.object({
   host: z.string().default("127.0.0.1"),
@@ -61,6 +150,7 @@ export const ServerConfigSchema = z.object({
    * Kept so older configs / CLI keep working; UI prefers proxyShield.
    */
   proxyMode: ProxyModeSchema.default("direct"),
+  failover: FailoverConfigSchema.default({}),
 });
 export type ServerConfig = z.infer<typeof ServerConfigSchema>;
 
@@ -102,6 +192,16 @@ export const GbgConfigSchema = z.object({
 });
 export type GbgConfig = z.infer<typeof GbgConfigSchema>;
 
+export interface AttemptLog {
+  providerId: string;
+  modelOut: string | null;
+  status?: number;
+  error?: string;
+  latencyMs?: number;
+  skipped?: boolean;
+  reason?: string;
+}
+
 export interface RequestLogEntry {
   id: string;
   ts: number;
@@ -128,6 +228,14 @@ export interface RequestLogEntry {
   streamStarted?: boolean;
   error?: string;
   stream?: boolean;
+  attempts?: AttemptLog[];
+}
+
+export interface RouteCandidate {
+  provider: Provider;
+  modelOut: string | null;
+  /** Empty providerId in map meant active provider at resolve time. */
+  fromActive: boolean;
 }
 
 export interface ResolvedRoute {
@@ -135,6 +243,7 @@ export interface ResolvedRoute {
   modelIn: string | null;
   modelOut: string | null;
   mapped: boolean;
+  candidates: RouteCandidate[];
 }
 
 export function createDefaultConfig(): GbgConfig {
@@ -147,6 +256,13 @@ export function createDefaultConfig(): GbgConfig {
       requestTimeoutMs: 600_000,
       proxyShield: true,
       proxyMode: "direct",
+      failover: {
+        enabled: true,
+        maxAttempts: 3,
+        firstByteTimeoutMs: 30_000,
+        cooldownMs: 60_000,
+        consecutiveFailures: 2,
+      },
     },
     activeProviderId: "okinto",
     providers: [

@@ -1,6 +1,6 @@
 [package]
 name = "gbg-desktop"
-version = "0.3.0"
+version = "1.1.0"
 description = "GrokBuild Gateway desktop shell (tray, autostart, start/stop)"
 authors = ["GrokBuild-Gateway"]
 edition = "2021"
